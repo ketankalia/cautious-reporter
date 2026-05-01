@@ -1,0 +1,1110 @@
+"""
+report_comparator.py
+====================
+A framework for comparing text-based reports that contain headers, footers,
+and page splits.  Supports both single-file and whole-folder comparison.
+
+─────────────────────────────────────────────
+SINGLE-FILE MODE
+─────────────────────────────────────────────
+    python report_comparator.py report_a.txt report_b.txt
+    python report_comparator.py report_a.txt report_b.txt --output diff.txt
+    python report_comparator.py report_a.txt report_b.txt --semantic
+
+─────────────────────────────────────────────
+FOLDER MODE  (pass two directory paths)
+─────────────────────────────────────────────
+    python report_comparator.py folder_a/ folder_b/
+    python report_comparator.py folder_a/ folder_b/ --output-dir results/
+    python report_comparator.py folder_a/ folder_b/ --ext .txt --semantic
+    python report_comparator.py folder_a/ folder_b/ --fuzzy-match
+    python report_comparator.py folder_a/ folder_b/ --no-diff --no-diff
+
+Folder mode produces:
+  • One comparison file per matched pair  →  <output-dir>/<filename>_comparison.txt
+  • A master summary across all files     →  <output-dir>/FOLDER_SUMMARY.txt
+
+Mismatch handling:
+  • Files present in only one folder are flagged as UNMATCHED.
+  • With --fuzzy-match, files whose names are similar (≥ 70 % ratio) are
+    paired even when names differ slightly (e.g. "report_v1.txt" ↔ "report_v2.txt").
+    The fuzzy-match log is included in the master summary.
+
+Dependencies (all stdlib except optional semantic mode):
+    - difflib       (stdlib)
+    - re            (stdlib)
+    - argparse      (stdlib)
+    - pathlib       (stdlib)
+    - scikit-learn  (optional — pip install scikit-learn)
+"""
+
+import re
+import difflib
+import argparse
+import sys
+import os
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Set
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Page:
+    number: int
+    raw_lines: List[str]
+    header_lines: List[str] = field(default_factory=list)
+    footer_lines: List[str] = field(default_factory=list)
+    body_lines: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Section:
+    title: str
+    level: int          # 1 = top-level, 2 = sub-section, etc.
+    lines: List[str] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return "\n".join(self.lines).strip()
+
+
+@dataclass
+class ParsedReport:
+    filename: str
+    pages: List[Page] = field(default_factory=list)
+    sections: List[Section] = field(default_factory=list)
+    global_header: List[str] = field(default_factory=list)   # repeating header
+    global_footer: List[str] = field(default_factory=list)   # repeating footer
+    body_lines: List[str] = field(default_factory=list)      # all body text (flat)
+
+
+@dataclass
+class ComparisonResult:
+    structural: Dict
+    metadata: Dict
+    content: Dict
+    sections: List[Dict]
+    summary: Dict
+
+
+# ---------------------------------------------------------------------------
+# 1.  PAGE SPLITTER
+# ---------------------------------------------------------------------------
+
+# Common page-break patterns in text reports
+_PAGE_BREAK_PATTERNS = [
+    r'\f',                                          # form-feed character
+    r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',           # --- Page 3 ---
+    r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',            # === Page 3 ===
+    r'^\s*[Pp]age\s+\d+\s+of\s+\d+\s*$',           # Page 3 of 10
+    r'^\s*[-_]{10,}\s*$',                           # ──────────────
+    r'^\s*\*{10,}\s*$',                             # ************
+]
+
+_PAGE_BREAK_RE = re.compile(
+    "|".join(_PAGE_BREAK_PATTERNS), re.MULTILINE
+)
+
+
+def split_into_pages(text: str) -> List[List[str]]:
+    """Split raw report text into a list of pages (each page = list of lines)."""
+    # Normalise line endings
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    # Split on page-break markers
+    chunks = _PAGE_BREAK_RE.split(text)
+
+    pages = []
+    for chunk in chunks:
+        lines = chunk.split("\n")
+        # Strip purely blank leading/trailing lines per page
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if lines:
+            pages.append(lines)
+
+    # Fallback: if no page breaks found, treat whole file as one page
+    if not pages:
+        lines = text.split("\n")
+        pages.append(lines)
+
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# 2.  HEADER / FOOTER DETECTOR
+# ---------------------------------------------------------------------------
+
+def detect_repeating_lines(pages: List[List[str]],
+                            check_lines: int = 3,
+                            min_frequency: float = 0.6) -> Tuple[List[str], List[str]]:
+    """
+    Identify lines that appear in the same position (top or bottom) across
+    a majority of pages — these are likely headers/footers.
+
+    Returns (header_candidates, footer_candidates) as lists of stripped strings.
+    """
+    if len(pages) < 2:
+        return [], []
+
+    threshold = max(2, int(len(pages) * min_frequency))
+
+    # Count occurrences of top-N and bottom-N lines across pages
+    top_counter: Counter = Counter()
+    bot_counter: Counter = Counter()
+
+    for page in pages:
+        for line in page[:check_lines]:
+            s = line.strip()
+            if s:
+                top_counter[s] += 1
+        for line in page[-check_lines:]:
+            s = line.strip()
+            if s:
+                bot_counter[s] += 1
+
+    headers = [ln for ln, cnt in top_counter.items() if cnt >= threshold]
+    footers = [ln for ln, cnt in bot_counter.items() if cnt >= threshold]
+
+    return headers, footers
+
+
+def strip_header_footer(page_lines: List[str],
+                        headers: List[str],
+                        footers: List[str],
+                        check_lines: int = 3) -> Tuple[List[str], List[str], List[str]]:
+    """
+    Remove header and footer lines from a page.
+    Returns (header_lines, body_lines, footer_lines).
+    """
+    lines = list(page_lines)
+    found_headers = []
+    found_footers = []
+
+    # Strip from top
+    i = 0
+    while i < min(check_lines, len(lines)):
+        if lines[i].strip() in headers:
+            found_headers.append(lines[i])
+            lines.pop(i)
+        else:
+            i += 1
+
+    # Strip from bottom
+    i = len(lines) - 1
+    stripped_foot = 0
+    while i >= max(0, len(lines) - check_lines) and stripped_foot < check_lines:
+        if lines[i].strip() in footers:
+            found_footers.insert(0, lines[i])
+            lines.pop(i)
+            stripped_foot += 1
+        i -= 1
+
+    return found_headers, lines, found_footers
+
+
+# ---------------------------------------------------------------------------
+# 3.  SECTION DETECTOR
+# ---------------------------------------------------------------------------
+
+# Heading patterns in order of priority (level, pattern)
+_HEADING_PATTERNS: List[Tuple[int, re.Pattern]] = [
+    (1, re.compile(r'^#{1}\s+.+')),                         # # Heading
+    (2, re.compile(r'^#{2}\s+.+')),                         # ## Heading
+    (3, re.compile(r'^#{3}\s+.+')),                         # ### Heading
+    (1, re.compile(r'^[A-Z][A-Z\s\d\-:]{4,}$')),           # ALL CAPS LINE
+    (1, re.compile(r'^\d+\.\s+[A-Z].+')),                   # 1. Title
+    (2, re.compile(r'^\d+\.\d+\s+[A-Z].+')),                # 1.1 Sub-title
+    (3, re.compile(r'^\d+\.\d+\.\d+\s+.+')),                # 1.1.1 Sub-sub
+    (1, re.compile(r'^[A-Z].{0,60}\n[=]{3,}$')),            # Underline with ===
+    (2, re.compile(r'^[A-Z].{0,60}\n[-]{3,}$')),            # Underline with ---
+]
+
+
+def detect_heading(line: str) -> Optional[int]:
+    """Return heading level (1, 2, 3…) if line looks like a section heading, else None."""
+    stripped = line.strip()
+    for level, pattern in _HEADING_PATTERNS:
+        if pattern.match(stripped):
+            return level
+    return None
+
+
+def extract_sections(body_lines: List[str]) -> List[Section]:
+    """
+    Parse body text into a list of Section objects based on detected headings.
+    Lines before the first heading go into an 'Introduction' section.
+    """
+    sections: List[Section] = []
+    current_title = "Introduction"
+    current_level = 1
+    current_lines: List[str] = []
+
+    for line in body_lines:
+        level = detect_heading(line)
+        if level is not None and line.strip():
+            # Save previous section
+            if current_lines or current_title != "Introduction":
+                sections.append(Section(title=current_title,
+                                        level=current_level,
+                                        lines=list(current_lines)))
+            current_title = line.strip().lstrip('#').strip()
+            current_level = level
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    # Save last section
+    sections.append(Section(title=current_title,
+                             level=current_level,
+                             lines=list(current_lines)))
+
+    return sections
+
+
+# ---------------------------------------------------------------------------
+# 4.  REPORT PARSER
+# ---------------------------------------------------------------------------
+
+def parse_report(filename: str) -> ParsedReport:
+    """Top-level parser: read file → pages → header/footer → sections."""
+    try:
+        with open(filename, "r", encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except FileNotFoundError:
+        print(f"ERROR: File not found: {filename}")
+        sys.exit(1)
+
+    report = ParsedReport(filename=filename)
+
+    raw_pages = split_into_pages(text)
+    global_headers, global_footers = detect_repeating_lines(raw_pages)
+
+    report.global_header = global_headers
+    report.global_footer = global_footers
+
+    all_body_lines: List[str] = []
+
+    for i, raw_lines in enumerate(raw_pages):
+        h, body, f = strip_header_footer(raw_lines, global_headers, global_footers)
+        page = Page(number=i + 1,
+                    raw_lines=raw_lines,
+                    header_lines=h,
+                    footer_lines=f,
+                    body_lines=body)
+        report.pages.append(page)
+        all_body_lines.extend(body)
+
+    report.body_lines = all_body_lines
+    report.sections = extract_sections(all_body_lines)
+
+    return report
+
+
+# ---------------------------------------------------------------------------
+# 5.  DIFF UTILITIES
+# ---------------------------------------------------------------------------
+
+def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
+    """Compute line-level diff stats between two lists of lines."""
+    matcher = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
+    added = deleted = changed = common = 0
+
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            common += (i2 - i1)
+        elif tag == "insert":
+            added += (j2 - j1)
+        elif tag == "delete":
+            deleted += (i2 - i1)
+        elif tag == "replace":
+            changed += max(i2 - i1, j2 - j1)
+
+    total = max(len(lines_a), len(lines_b), 1)
+    return {
+        "lines_added": added,
+        "lines_deleted": deleted,
+        "lines_changed": changed,
+        "lines_common": common,
+        "similarity_ratio": round(matcher.ratio(), 4),
+        "change_pct": round((added + deleted + changed) / total * 100, 2),
+    }
+
+
+def unified_diff_text(lines_a: List[str], lines_b: List[str],
+                      label_a: str = "Report A",
+                      label_b: str = "Report B",
+                      context: int = 3) -> str:
+    """Return a unified diff string."""
+    diff = difflib.unified_diff(
+        lines_a, lines_b,
+        fromfile=label_a, tofile=label_b,
+        lineterm="", n=context
+    )
+    return "\n".join(diff)
+
+
+# ---------------------------------------------------------------------------
+# 6.  SEMANTIC SIMILARITY (optional — requires scikit-learn)
+# ---------------------------------------------------------------------------
+
+def semantic_similarity(text_a: str, text_b: str) -> Optional[float]:
+    """
+    Compute TF-IDF cosine similarity between two text blocks.
+    Returns a float in [0, 1], or None if scikit-learn is not installed.
+    """
+    try:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity as cos_sim
+        import numpy as np  # noqa: F401
+    except ImportError:
+        return None
+
+    if not text_a.strip() or not text_b.strip():
+        return 0.0
+
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    try:
+        tfidf = vec.fit_transform([text_a, text_b])
+        score = cos_sim(tfidf[0:1], tfidf[1:2])[0][0]
+        return round(float(score), 4)
+    except ValueError:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# 7.  SECTION-AWARE COMPARISON
+# ---------------------------------------------------------------------------
+
+def match_sections(sections_a: List[Section],
+                   sections_b: List[Section]) -> List[Tuple[Optional[Section], Optional[Section]]]:
+    """
+    Match sections between two reports by title similarity.
+    Uses SequenceMatcher on title strings for fuzzy matching.
+    Returns a list of (section_a, section_b) pairs (None if unmatched).
+    """
+    titles_a = [s.title.lower() for s in sections_a]
+    titles_b = [s.title.lower() for s in sections_b]
+
+    matched: List[Tuple[Optional[Section], Optional[Section]]] = []
+    used_b = set()
+
+    for i, sec_a in enumerate(sections_a):
+        best_ratio = 0.0
+        best_j = -1
+        for j, sec_b in enumerate(sections_b):
+            if j in used_b:
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, titles_a[i], titles_b[j]
+            ).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_j = j
+
+        if best_ratio >= 0.6 and best_j >= 0:
+            matched.append((sec_a, sections_b[best_j]))
+            used_b.add(best_j)
+        else:
+            matched.append((sec_a, None))      # section only in A
+
+    # Sections only in B
+    for j, sec_b in enumerate(sections_b):
+        if j not in used_b:
+            matched.append((None, sec_b))
+
+    return matched
+
+
+def compare_sections(sections_a: List[Section],
+                     sections_b: List[Section],
+                     use_semantic: bool = False) -> List[Dict]:
+    """Compare sections pairwise and return per-section results."""
+    pairs = match_sections(sections_a, sections_b)
+    results = []
+
+    for sec_a, sec_b in pairs:
+        entry: Dict = {}
+
+        if sec_a and sec_b:
+            entry["status"] = "matched"
+            entry["title_a"] = sec_a.title
+            entry["title_b"] = sec_b.title
+            entry["title_changed"] = sec_a.title.strip() != sec_b.title.strip()
+            diff = line_diff_stats(sec_a.lines, sec_b.lines)
+            entry["diff"] = diff
+            if use_semantic:
+                entry["semantic_similarity"] = semantic_similarity(
+                    sec_a.text, sec_b.text
+                )
+        elif sec_a:
+            entry["status"] = "removed"
+            entry["title_a"] = sec_a.title
+            entry["lines"] = len(sec_a.lines)
+        else:
+            entry["status"] = "added"
+            entry["title_b"] = sec_b.title
+            entry["lines"] = len(sec_b.lines)
+
+        results.append(entry)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 8.  TOP-LEVEL COMPARISON
+# ---------------------------------------------------------------------------
+
+def compare_reports(report_a: ParsedReport,
+                    report_b: ParsedReport,
+                    use_semantic: bool = False) -> ComparisonResult:
+    """Run all comparison dimensions and return a ComparisonResult."""
+
+    # -- Structural --
+    structural = {
+        "page_count_a": len(report_a.pages),
+        "page_count_b": len(report_b.pages),
+        "page_count_delta": len(report_b.pages) - len(report_a.pages),
+        "section_count_a": len(report_a.sections),
+        "section_count_b": len(report_b.sections),
+        "section_count_delta": len(report_b.sections) - len(report_a.sections),
+        "body_line_count_a": len(report_a.body_lines),
+        "body_line_count_b": len(report_b.body_lines),
+    }
+
+    # -- Metadata (header/footer) --
+    hdr_a = set(report_a.global_header)
+    hdr_b = set(report_b.global_header)
+    ftr_a = set(report_a.global_footer)
+    ftr_b = set(report_b.global_footer)
+
+    metadata = {
+        "headers_only_in_a": sorted(hdr_a - hdr_b),
+        "headers_only_in_b": sorted(hdr_b - hdr_a),
+        "headers_common": sorted(hdr_a & hdr_b),
+        "footers_only_in_a": sorted(ftr_a - ftr_b),
+        "footers_only_in_b": sorted(ftr_b - ftr_a),
+        "footers_common": sorted(ftr_a & ftr_b),
+    }
+
+    # -- Content (whole-body diff) --
+    content = line_diff_stats(report_a.body_lines, report_b.body_lines)
+    if use_semantic:
+        content["semantic_similarity"] = semantic_similarity(
+            "\n".join(report_a.body_lines),
+            "\n".join(report_b.body_lines)
+        )
+
+    # -- Section-level --
+    section_results = compare_sections(
+        report_a.sections, report_b.sections, use_semantic=use_semantic
+    )
+
+    # -- Summary --
+    matched  = sum(1 for s in section_results if s["status"] == "matched")
+    added    = sum(1 for s in section_results if s["status"] == "added")
+    removed  = sum(1 for s in section_results if s["status"] == "removed")
+    changed  = sum(
+        1 for s in section_results
+        if s["status"] == "matched" and s["diff"]["similarity_ratio"] < 1.0
+    )
+    identical = sum(
+        1 for s in section_results
+        if s["status"] == "matched" and s["diff"]["similarity_ratio"] == 1.0
+    )
+
+    summary = {
+        "overall_similarity_ratio": content["similarity_ratio"],
+        "overall_change_pct": content["change_pct"],
+        "sections_matched": matched,
+        "sections_added": added,
+        "sections_removed": removed,
+        "sections_with_changes": changed,
+        "sections_identical": identical,
+        "verdict": _verdict(content["similarity_ratio"]),
+    }
+
+    return ComparisonResult(
+        structural=structural,
+        metadata=metadata,
+        content=content,
+        sections=section_results,
+        summary=summary,
+    )
+
+
+def _verdict(ratio: float) -> str:
+    if ratio >= 0.98:
+        return "IDENTICAL or near-identical"
+    elif ratio >= 0.85:
+        return "MINOR differences"
+    elif ratio >= 0.60:
+        return "MODERATE differences"
+    else:
+        return "SIGNIFICANT differences"
+
+
+# ---------------------------------------------------------------------------
+# 9.  OUTPUT FORMATTER
+# ---------------------------------------------------------------------------
+
+def format_report(result: ComparisonResult,
+                  report_a: ParsedReport,
+                  report_b: ParsedReport,
+                  include_diff: bool = True) -> str:
+    lines = []
+
+    def h(title: str, char: str = "="):
+        lines.append("")
+        lines.append(char * 60)
+        lines.append(f"  {title}")
+        lines.append(char * 60)
+
+    def kv(k: str, v):
+        lines.append(f"  {k:<35} {v}")
+
+    # Header
+    lines.append("=" * 60)
+    lines.append("  REPORT COMPARISON SUMMARY")
+    lines.append("=" * 60)
+    lines.append(f"  Report A : {report_a.filename}")
+    lines.append(f"  Report B : {report_b.filename}")
+    lines.append("")
+
+    # Summary
+    h("OVERALL SUMMARY")
+    kv("Verdict:", result.summary["verdict"])
+    kv("Overall similarity:", f"{result.summary['overall_similarity_ratio'] * 100:.1f}%")
+    kv("Overall change:", f"{result.summary['overall_change_pct']}% of lines affected")
+
+    # Structural
+    h("STRUCTURAL COMPARISON", "-")
+    s = result.structural
+    kv("Pages (A / B):", f"{s['page_count_a']} / {s['page_count_b']}  (delta: {s['page_count_delta']:+d})")
+    kv("Sections (A / B):", f"{s['section_count_a']} / {s['section_count_b']}  (delta: {s['section_count_delta']:+d})")
+    kv("Body lines (A / B):", f"{s['body_line_count_a']} / {s['body_line_count_b']}")
+
+    # Metadata
+    h("HEADER / FOOTER COMPARISON", "-")
+    m = result.metadata
+    if m["headers_common"]:
+        lines.append(f"  Common headers   : {', '.join(m['headers_common'])}")
+    if m["headers_only_in_a"]:
+        lines.append(f"  Headers only in A: {', '.join(m['headers_only_in_a'])}")
+    if m["headers_only_in_b"]:
+        lines.append(f"  Headers only in B: {', '.join(m['headers_only_in_b'])}")
+    if m["footers_common"]:
+        lines.append(f"  Common footers   : {', '.join(m['footers_common'])}")
+    if m["footers_only_in_a"]:
+        lines.append(f"  Footers only in A: {', '.join(m['footers_only_in_a'])}")
+    if m["footers_only_in_b"]:
+        lines.append(f"  Footers only in B: {', '.join(m['footers_only_in_b'])}")
+    if not any(m.values()):
+        lines.append("  No persistent headers/footers detected.")
+
+    # Content diff stats
+    h("CONTENT DIFF STATISTICS", "-")
+    c = result.content
+    kv("Lines added:", c["lines_added"])
+    kv("Lines deleted:", c["lines_deleted"])
+    kv("Lines changed:", c["lines_changed"])
+    kv("Lines common:", c["lines_common"])
+    kv("Similarity ratio:", c["similarity_ratio"])
+    if "semantic_similarity" in c and c["semantic_similarity"] is not None:
+        kv("Semantic similarity (TF-IDF):", c["semantic_similarity"])
+
+    # Section comparison
+    h("SECTION-BY-SECTION COMPARISON", "-")
+    sm = result.summary
+    kv("Sections matched:", sm["sections_matched"])
+    kv("Sections added (only in B):", sm["sections_added"])
+    kv("Sections removed (only in A):", sm["sections_removed"])
+    kv("Matched sections with changes:", sm["sections_with_changes"])
+    kv("Matched sections identical:", sm["sections_identical"])
+
+    lines.append("")
+    for sec in result.sections:
+        status = sec["status"].upper()
+        if sec["status"] == "matched":
+            title = sec["title_a"]
+            ratio = sec["diff"]["similarity_ratio"]
+            flag = "" if ratio == 1.0 else f"  [similarity: {ratio * 100:.1f}%]"
+            lines.append(f"  [MATCHED ] {title}{flag}")
+            if sec.get("title_changed"):
+                lines.append(f"           Title changed → {sec['title_b']}")
+            d = sec["diff"]
+            if d["lines_added"] or d["lines_deleted"] or d["lines_changed"]:
+                lines.append(
+                    f"           +{d['lines_added']} added  "
+                    f"-{d['lines_deleted']} deleted  "
+                    f"~{d['lines_changed']} changed"
+                )
+            if "semantic_similarity" in sec and sec["semantic_similarity"] is not None:
+                lines.append(f"           Semantic similarity: {sec['semantic_similarity']}")
+        elif sec["status"] == "added":
+            lines.append(f"  [ADDED   ] {sec['title_b']}  ({sec['lines']} lines)")
+        else:
+            lines.append(f"  [REMOVED ] {sec['title_a']}  ({sec['lines']} lines)")
+
+    # Unified diff
+    if include_diff:
+        h("UNIFIED DIFF (body content)", "-")
+        diff_text = unified_diff_text(
+            report_a.body_lines,
+            report_b.body_lines,
+            label_a=report_a.filename,
+            label_b=report_b.filename,
+        )
+        if diff_text.strip():
+            lines.append(diff_text)
+        else:
+            lines.append("  No differences in body content.")
+
+    lines.append("")
+    lines.append("=" * 60)
+    lines.append("  END OF COMPARISON REPORT")
+    lines.append("=" * 60)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 10.  FOLDER SCANNER
+# ---------------------------------------------------------------------------
+
+def scan_folder(folder: Path, ext: str = ".txt") -> Dict[str, Path]:
+    """
+    Return a dict of { filename (lowercase) → absolute Path } for all files
+    with the given extension directly inside *folder* (non-recursive).
+    """
+    if not folder.is_dir():
+        print(f"ERROR: Not a directory: {folder}", file=sys.stderr)
+        sys.exit(1)
+    return {
+        p.name.lower(): p
+        for p in sorted(folder.iterdir())
+        if p.is_file() and p.suffix.lower() == ext.lower()
+    }
+
+
+# ---------------------------------------------------------------------------
+# 11.  FILENAME MATCHER  (exact + fuzzy)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FolderMatchResult:
+    """Encapsulates the file-level matching outcome for two folders."""
+    exact_pairs:   List[Tuple[Path, Path]]          # same filename in both
+    fuzzy_pairs:   List[Tuple[Path, Path, float]]   # similar name, (file_a, file_b, ratio)
+    only_in_a:     List[Path]                        # no counterpart in B
+    only_in_b:     List[Path]                        # no counterpart in A
+
+
+def match_filenames(files_a: Dict[str, Path],
+                    files_b: Dict[str, Path],
+                    fuzzy: bool = False,
+                    fuzzy_threshold: float = 0.70) -> FolderMatchResult:
+    """
+    Match files between two folders.
+
+    Strategy:
+      1. Exact match  — identical filename (case-insensitive).
+      2. Fuzzy match  — if --fuzzy-match is set, pair unmatched files whose
+                        names are similar enough (SequenceMatcher ratio ≥ threshold).
+                        Each file is paired at most once (greedy best-first).
+      3. Unmatched    — remainder go into only_in_a / only_in_b.
+    """
+    keys_a: Set[str] = set(files_a.keys())
+    keys_b: Set[str] = set(files_b.keys())
+
+    # 1. Exact matches
+    exact_keys = keys_a & keys_b
+    exact_pairs = [(files_a[k], files_b[k]) for k in sorted(exact_keys)]
+
+    unmatched_a = sorted(keys_a - exact_keys)
+    unmatched_b = sorted(keys_b - exact_keys)
+
+    fuzzy_pairs: List[Tuple[Path, Path, float]] = []
+
+    # 2. Fuzzy matches
+    if fuzzy and unmatched_a and unmatched_b:
+        # Build all candidate ratios
+        candidates: List[Tuple[float, str, str]] = []
+        for ka in unmatched_a:
+            for kb in unmatched_b:
+                ratio = difflib.SequenceMatcher(None, ka, kb).ratio()
+                if ratio >= fuzzy_threshold:
+                    candidates.append((ratio, ka, kb))
+
+        # Sort descending by ratio and greedily assign
+        candidates.sort(key=lambda x: -x[0])
+        used_a: Set[str] = set()
+        used_b: Set[str] = set()
+
+        for ratio, ka, kb in candidates:
+            if ka in used_a or kb in used_b:
+                continue
+            fuzzy_pairs.append((files_a[ka], files_b[kb], round(ratio, 4)))
+            used_a.add(ka)
+            used_b.add(kb)
+
+        unmatched_a = [k for k in unmatched_a if k not in used_a]
+        unmatched_b = [k for k in unmatched_b if k not in used_b]
+
+    return FolderMatchResult(
+        exact_pairs=exact_pairs,
+        fuzzy_pairs=fuzzy_pairs,
+        only_in_a=[files_a[k] for k in unmatched_a],
+        only_in_b=[files_b[k] for k in unmatched_b],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 12.  FOLDER-LEVEL COMPARISON RUNNER
+# ---------------------------------------------------------------------------
+
+@dataclass
+class FilePairOutcome:
+    file_a: Path
+    file_b: Path
+    match_type: str           # "exact" | "fuzzy"
+    fuzzy_ratio: float        # name-similarity ratio (1.0 for exact)
+    result: Optional[ComparisonResult]
+    error: Optional[str] = None
+
+
+def compare_folder_pair(path_a: Path,
+                        path_b: Path,
+                        match_type: str,
+                        fuzzy_ratio: float,
+                        use_semantic: bool) -> FilePairOutcome:
+    """Parse and compare one pair of files. Catches errors gracefully."""
+    try:
+        ra = parse_report(str(path_a))
+        rb = parse_report(str(path_b))
+        result = compare_reports(ra, rb, use_semantic=use_semantic)
+        return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result)
+    except Exception as exc:
+        return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
+                               result=None, error=str(exc))
+
+
+def run_folder_comparison(folder_a: Path,
+                           folder_b: Path,
+                           ext: str = ".txt",
+                           fuzzy: bool = False,
+                           fuzzy_threshold: float = 0.70,
+                           use_semantic: bool = False,
+                           output_dir: Optional[Path] = None,
+                           include_diff: bool = True) -> None:
+    """
+    Top-level folder comparison.  Scans both folders, matches files,
+    runs per-file comparisons, writes individual reports, and writes
+    a master FOLDER_SUMMARY.txt.
+    """
+    print(f"\nScanning folder A : {folder_a}", file=sys.stderr)
+    files_a = scan_folder(folder_a, ext)
+    print(f"Scanning folder B : {folder_b}", file=sys.stderr)
+    files_b = scan_folder(folder_b, ext)
+
+    print(f"  Found {len(files_a)} file(s) in A,  {len(files_b)} file(s) in B", file=sys.stderr)
+
+    match = match_filenames(files_a, files_b, fuzzy=fuzzy,
+                            fuzzy_threshold=fuzzy_threshold)
+
+    total_pairs = len(match.exact_pairs) + len(match.fuzzy_pairs)
+    print(f"  Matched : {len(match.exact_pairs)} exact  +  "
+          f"{len(match.fuzzy_pairs)} fuzzy  =  {total_pairs} pairs", file=sys.stderr)
+    print(f"  Unmatched : {len(match.only_in_a)} only-in-A,  "
+          f"{len(match.only_in_b)} only-in-B", file=sys.stderr)
+
+    if output_dir:
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Run comparisons ----
+    outcomes: List[FilePairOutcome] = []
+
+    for pa, pb in match.exact_pairs:
+        print(f"  Comparing [exact ] {pa.name}", file=sys.stderr)
+        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic)
+        outcomes.append(outcome)
+        _write_pair_report(outcome, output_dir, include_diff)
+
+    for pa, pb, ratio in match.fuzzy_pairs:
+        print(f"  Comparing [fuzzy ] {pa.name} ↔ {pb.name}  (name similarity {ratio:.0%})",
+              file=sys.stderr)
+        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic)
+        outcomes.append(outcome)
+        _write_pair_report(outcome, output_dir, include_diff)
+
+    # ---- Master summary ----
+    summary_text = _format_folder_summary(
+        folder_a, folder_b, match, outcomes, ext
+    )
+
+    if output_dir:
+        summary_path = output_dir / "FOLDER_SUMMARY.txt"
+        summary_path.write_text(summary_text, encoding="utf-8")
+        print(f"\n  Master summary → {summary_path}", file=sys.stderr)
+    else:
+        print(summary_text)
+
+
+def _write_pair_report(outcome: FilePairOutcome,
+                       output_dir: Optional[Path],
+                       include_diff: bool) -> None:
+    """Write a single pair's comparison report to output_dir (or stdout)."""
+    if outcome.error:
+        text = (f"ERROR comparing {outcome.file_a.name} ↔ {outcome.file_b.name}\n"
+                f"{outcome.error}\n")
+    else:
+        ra = ParsedReport(filename=str(outcome.file_a))
+        rb = ParsedReport(filename=str(outcome.file_b))
+        # Re-parse to get full objects for the formatter
+        ra = parse_report(str(outcome.file_a))
+        rb = parse_report(str(outcome.file_b))
+        text = format_report(outcome.result, ra, rb, include_diff=include_diff)
+
+    if output_dir:
+        # Use file_a's stem as base; append _vs_<file_b_stem> for fuzzy pairs
+        if outcome.match_type == "fuzzy":
+            stem = f"{outcome.file_a.stem}_vs_{outcome.file_b.stem}"
+        else:
+            stem = outcome.file_a.stem
+        out_path = output_dir / f"{stem}_comparison.txt"
+        out_path.write_text(text, encoding="utf-8")
+    else:
+        print(text)
+        print()
+
+
+# ---------------------------------------------------------------------------
+# 13.  FOLDER SUMMARY FORMATTER
+# ---------------------------------------------------------------------------
+
+def _format_folder_summary(folder_a: Path,
+                            folder_b: Path,
+                            match: FolderMatchResult,
+                            outcomes: List[FilePairOutcome],
+                            ext: str) -> str:
+    W = 70
+    lines = []
+
+    def h(title: str, char: str = "="):
+        lines.append("")
+        lines.append(char * W)
+        lines.append(f"  {title}")
+        lines.append(char * W)
+
+    def kv(k: str, v, w: int = 38):
+        lines.append(f"  {k:<{w}} {v}")
+
+    def verdict_icon(v: str) -> str:
+        if "IDENTICAL" in v:   return "✓"
+        if "MINOR"    in v:    return "~"
+        if "MODERATE" in v:    return "!"
+        return "✗"
+
+    # Title
+    lines.append("=" * W)
+    lines.append("  FOLDER COMPARISON — MASTER SUMMARY")
+    lines.append("=" * W)
+    lines.append(f"  Folder A : {folder_a}")
+    lines.append(f"  Folder B : {folder_b}")
+    lines.append(f"  File ext : {ext}")
+
+    # Counts
+    h("FILE MATCHING OVERVIEW")
+    total_a = len(match.exact_pairs) + len(match.fuzzy_pairs) + len(match.only_in_a)
+    total_b = len(match.exact_pairs) + len(match.fuzzy_pairs) + len(match.only_in_b)
+    kv("Files in folder A:", total_a)
+    kv("Files in folder B:", total_b)
+    kv("Exactly matched pairs:", len(match.exact_pairs))
+    kv("Fuzzy-matched pairs:", len(match.fuzzy_pairs))
+    kv("Unmatched — only in A:", len(match.only_in_a))
+    kv("Unmatched — only in B:", len(match.only_in_b))
+
+    # Unmatched files detail
+    if match.only_in_a:
+        h("UNMATCHED FILES — ONLY IN FOLDER A", "-")
+        for p in match.only_in_a:
+            lines.append(f"  [MISSING IN B]  {p.name}")
+
+    if match.only_in_b:
+        h("UNMATCHED FILES — ONLY IN FOLDER B", "-")
+        for p in match.only_in_b:
+            lines.append(f"  [MISSING IN A]  {p.name}")
+
+    # Fuzzy match log
+    if match.fuzzy_pairs:
+        h("FUZZY-MATCHED PAIRS (name similarity)", "-")
+        lines.append(f"  {'File in A':<30} {'File in B':<30} {'Name sim':>8}")
+        lines.append(f"  {'-'*30} {'-'*30} {'-'*8}")
+        for pa, pb, ratio in match.fuzzy_pairs:
+            lines.append(f"  {pa.name:<30} {pb.name:<30} {ratio:>7.1%}")
+
+    # Per-file results table
+    h("PER-FILE COMPARISON RESULTS")
+    col = [28, 28, 8, 8, 8]
+    hdr = (f"  {'File A':<{col[0]}} {'File B':<{col[1]}} "
+           f"{'Similar':>{col[2]}} {'Change%':>{col[3]}} {'Verdict':>{col[4]}}")
+    lines.append(hdr)
+    lines.append("  " + "-" * (sum(col) + len(col) - 1))
+
+    errors = []
+    similarity_scores = []
+
+    for outcome in outcomes:
+        fa = outcome.file_a.name
+        fb = outcome.file_b.name
+        mtype = "" if outcome.match_type == "exact" else f"[fuzzy {outcome.fuzzy_ratio:.0%}] "
+
+        if outcome.error:
+            errors.append(outcome)
+            lines.append(f"  {(mtype+fa):<{col[0]}} {fb:<{col[1]}} {'ERROR':>{col[2]+col[3]+col[4]+2}}")
+            continue
+
+        s = outcome.result.summary
+        ratio = s["overall_similarity_ratio"]
+        chg   = s["overall_change_pct"]
+        verd  = verdict_icon(s["verdict"])
+        similarity_scores.append(ratio)
+
+        lines.append(
+            f"  {(mtype+fa):<{col[0]}} {fb:<{col[1]}} "
+            f"{ratio:>{col[2]}.1%} {chg:>{col[3]}.1f}% {verd:>{col[4]}}"
+        )
+
+    # Aggregate stats
+    h("AGGREGATE STATISTICS")
+    if similarity_scores:
+        avg_sim = sum(similarity_scores) / len(similarity_scores)
+        min_sim = min(similarity_scores)
+        max_sim = max(similarity_scores)
+        kv("Files compared successfully:", len(similarity_scores))
+        kv("Average similarity:", f"{avg_sim:.1%}")
+        kv("Most similar pair:", f"{max_sim:.1%}")
+        kv("Least similar pair:", f"{min_sim:.1%}")
+
+        identical  = sum(1 for r in similarity_scores if r >= 0.98)
+        minor      = sum(1 for r in similarity_scores if 0.85 <= r < 0.98)
+        moderate   = sum(1 for r in similarity_scores if 0.60 <= r < 0.85)
+        significant= sum(1 for r in similarity_scores if r < 0.60)
+
+        lines.append("")
+        kv("✓  IDENTICAL / near-identical:", identical)
+        kv("~  MINOR differences:", minor)
+        kv("!  MODERATE differences:", moderate)
+        kv("✗  SIGNIFICANT differences:", significant)
+
+    if errors:
+        h("ERRORS ENCOUNTERED", "-")
+        for o in errors:
+            lines.append(f"  {o.file_a.name} ↔ {o.file_b.name}")
+            lines.append(f"    {o.error}")
+
+    lines.append("")
+    lines.append("=" * W)
+    lines.append("  END OF FOLDER SUMMARY")
+    lines.append("=" * W)
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 14.  CLI ENTRY POINT  (file mode + folder mode)
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Compare text-based reports (single file pair OR two whole folders).\n"
+            "Pass two FILE paths for single-file mode.\n"
+            "Pass two DIRECTORY paths for folder mode."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("source_a",
+                        help="Baseline report file  OR  baseline folder")
+    parser.add_argument("source_b",
+                        help="Comparison report file  OR  comparison folder")
+
+    # ---- shared options ----
+    parser.add_argument("--semantic", action="store_true",
+                        help="Enable TF-IDF semantic similarity (requires scikit-learn)")
+    parser.add_argument("--no-diff", action="store_true",
+                        help="Skip unified diff output (recommended for large files)")
+
+    # ---- single-file options ----
+    parser.add_argument("--output", "-o",
+                        help="[File mode] Save result to this path (default: stdout)")
+
+    # ---- folder options ----
+    parser.add_argument("--output-dir", "-d",
+                        help="[Folder mode] Directory for per-file reports + summary "
+                             "(default: print to stdout)")
+    parser.add_argument("--ext", default=".txt",
+                        help="[Folder mode] File extension to include (default: .txt)")
+    parser.add_argument("--fuzzy-match", action="store_true",
+                        help="[Folder mode] Also pair files with similar (but not identical) names")
+    parser.add_argument("--fuzzy-threshold", type=float, default=0.70,
+                        help="[Folder mode] Min name-similarity ratio for fuzzy match (default: 0.70)")
+
+    args = parser.parse_args()
+
+    path_a = Path(args.source_a)
+    path_b = Path(args.source_b)
+
+    # ------------------------------------------------------------------ FOLDER
+    if path_a.is_dir() and path_b.is_dir():
+        output_dir = Path(args.output_dir) if args.output_dir else None
+        run_folder_comparison(
+            folder_a=path_a,
+            folder_b=path_b,
+            ext=args.ext,
+            fuzzy=args.fuzzy_match,
+            fuzzy_threshold=args.fuzzy_threshold,
+            use_semantic=args.semantic,
+            output_dir=output_dir,
+            include_diff=not args.no_diff,
+        )
+
+    # ------------------------------------------------------------------ FILE
+    elif path_a.is_file() and path_b.is_file():
+        print(f"Parsing  : {path_a}", file=sys.stderr)
+        report_a = parse_report(str(path_a))
+        print(f"Parsing  : {path_b}", file=sys.stderr)
+        report_b = parse_report(str(path_b))
+
+        print("Comparing...", file=sys.stderr)
+        result = compare_reports(report_a, report_b, use_semantic=args.semantic)
+
+        output = format_report(result, report_a, report_b,
+                                include_diff=not args.no_diff)
+
+        if args.output:
+            Path(args.output).write_text(output, encoding="utf-8")
+            print(f"Saved to : {args.output}", file=sys.stderr)
+        else:
+            print(output)
+
+    # ------------------------------------------------------------------ ERROR
+    else:
+        print("ERROR: Both arguments must be files, or both must be directories.",
+              file=sys.stderr)
+        print(f"  source_a = {path_a}  ({'dir' if path_a.is_dir() else 'file' if path_a.is_file() else 'NOT FOUND'})",
+              file=sys.stderr)
+        print(f"  source_b = {path_b}  ({'dir' if path_b.is_dir() else 'file' if path_b.is_file() else 'NOT FOUND'})",
+              file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
