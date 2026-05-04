@@ -384,32 +384,60 @@ def semantic_similarity(text_a: str, text_b: str) -> Optional[float]:
 # ---------------------------------------------------------------------------
 
 def match_sections(sections_a: List[Section],
-                   sections_b: List[Section]) -> List[Tuple[Optional[Section], Optional[Section]]]:
+                   sections_b: List[Section],
+                   threshold: float = 0.6) -> List[Tuple[Optional[Section], Optional[Section]]]:
     """
     Match sections between two reports by title similarity.
-    Uses SequenceMatcher on title strings for fuzzy matching.
-    Returns a list of (section_a, section_b) pairs (None if unmatched).
+
+    Performance strategy (mirrors the pattern recommended in the difflib docs):
+      For each title in A we create ONE SequenceMatcher with seq1 fixed, then
+      iterate over candidates in B by calling set_seq2().  This lets difflib
+      cache the Junk-table and length analysis for seq1 across all B comparisons,
+      avoiding repeated object construction.
+
+      Two cheap upper-bound gates are checked before the full O(n·m) ratio():
+        1. real_quick_ratio() — O(1), based on lengths alone.
+        2. quick_ratio()      — O(n+m), based on a single common-char count.
+      Only pairs that survive both gates reach the expensive ratio() call,
+      reducing work from O(A·B) full computations to O(A·B) fast checks +
+      O(A · few) full computations in the typical case.
+
+    Returns a list of (section_a, section_b) pairs (None where unmatched).
     """
     titles_a = [s.title.lower() for s in sections_a]
     titles_b = [s.title.lower() for s in sections_b]
 
     matched: List[Tuple[Optional[Section], Optional[Section]]] = []
-    used_b = set()
+    used_b: set = set()
 
     for i, sec_a in enumerate(sections_a):
         best_ratio = 0.0
         best_j = -1
-        for j, sec_b in enumerate(sections_b):
+
+        # One matcher per outer title; seq2 is swapped cheaply via set_seq2()
+        matcher = difflib.SequenceMatcher(None, titles_a[i], "", autojunk=False)
+
+        for j in range(len(sections_b)):
             if j in used_b:
                 continue
-            ratio = difflib.SequenceMatcher(
-                None, titles_a[i], titles_b[j]
-            ).ratio()
+
+            matcher.set_seq2(titles_b[j])
+
+            # Gate 1 — O(1): pure length-based ceiling; skip if impossible to reach threshold
+            if matcher.real_quick_ratio() < threshold:
+                continue
+
+            # Gate 2 — O(n+m): common-char ceiling; eliminates more without full alignment
+            if matcher.quick_ratio() < threshold:
+                continue
+
+            # Gate 3 — full O(n·m) edit-distance ratio, reached only for close candidates
+            ratio = matcher.ratio()
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_j = j
 
-        if best_ratio >= 0.6 and best_j >= 0:
+        if best_ratio >= threshold and best_j >= 0:
             matched.append((sec_a, sections_b[best_j]))
             used_b.add(best_j)
         else:
