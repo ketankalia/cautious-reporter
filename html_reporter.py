@@ -163,7 +163,7 @@ def file_link(label: str, url: str, name: str) -> str:
 
 
 def bcompare_button(bat_url: str, cmd_a: str, cmd_b: str, bcompare_exe: str) -> str:
-    cmd = f'{bcompare_exe} "{cmd_a}" "{cmd_b}"'
+    cmd = f'{bcompare_exe} "{cmd_a}" "{cmd_b}"'a
     esc = cmd.replace('"', '&quot;').replace("'", "&#39;")
     return (
         f'<div class="bc-row">'
@@ -412,7 +412,7 @@ def pair_card(outcome: FilePairOutcome,
             + build_diff_html(body_lines_a, body_lines_b) +
             f'</div>'
         )
-        diff_toggle = f'<span class="card-toggle" onclick="toggle(\'{diff_id}\')">▶ diff</span>'
+        diff_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{diff_id}\')">▶ diff</span>'
     else:
         diff_panel  = ''
         diff_toggle = '<span class="card-toggle no-diff">✓ no diff</span>'
@@ -424,7 +424,7 @@ def pair_card(outcome: FilePairOutcome,
     <span class="badge {v_css}">{v_lbl}</span>
     <span class="card-title">{outcome.file_a.name}</span>
     {match_tag}
-    <span class="card-toggle" onclick="toggle('{sec_id}')">▶ sections</span>
+    <span class="card-toggle" onclick="toggle(this,'{sec_id}')">▶ sections</span>
     {diff_toggle}
   </div>
 
@@ -674,14 +674,11 @@ mark.wi{background:#bbf7d0;color:#14532d;border-radius:2px;padding:0 1px}
 """
 
 JS = """
-function toggle(id){
+function toggle(btn,id){
   const el=document.getElementById(id);
   const wasOpen=el.classList.contains('open');
   el.classList.toggle('open');
-  // Flip the ▶/▼ arrow on whichever toggle button fired this panel
-  document.querySelectorAll('[onclick="toggle(\''+id+'\')"]').forEach(btn=>{
-    btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶', wasOpen?'▶':'▼');
-  });
+  btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶',wasOpen?'▶':'▼');
 }
 function copyCmd(btn){
   const cmd=btn.getAttribute('data-cmd');
