@@ -30,11 +30,12 @@ Mismatch handling:
     paired even when names differ slightly (e.g. "report_v1.txt" ↔ "report_v2.txt").
     The fuzzy-match log is included in the master summary.
 
-Dependencies (all stdlib except optional semantic mode):
+Dependencies:
     - difflib       (stdlib)
     - re            (stdlib)
     - argparse      (stdlib)
     - pathlib       (stdlib)
+    - pandas        (pip install pandas)
     - scikit-learn  (optional — pip install scikit-learn)
 """
 
@@ -43,7 +44,7 @@ import difflib
 import argparse
 import sys
 import os
-from collections import Counter
+import pandas as pd
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
@@ -156,22 +157,18 @@ def detect_repeating_lines(pages: List[List[str]],
 
     threshold = max(2, int(len(pages) * min_frequency))
 
-    # Count occurrences of top-N and bottom-N lines across pages
-    top_counter: Counter = Counter()
-    bot_counter: Counter = Counter()
+    top_series = pd.Series(
+        [line.strip() for page in pages for line in page[:check_lines]]
+    )
+    bot_series = pd.Series(
+        [line.strip() for page in pages for line in page[-check_lines:]]
+    )
 
-    for page in pages:
-        for line in page[:check_lines]:
-            s = line.strip()
-            if s:
-                top_counter[s] += 1
-        for line in page[-check_lines:]:
-            s = line.strip()
-            if s:
-                bot_counter[s] += 1
+    top_counts = top_series[top_series != ""].value_counts()
+    bot_counts = bot_series[bot_series != ""].value_counts()
 
-    headers = [ln for ln, cnt in top_counter.items() if cnt >= threshold]
-    footers = [ln for ln, cnt in bot_counter.items() if cnt >= threshold]
+    headers = top_counts[top_counts >= threshold].index.tolist()
+    footers = bot_counts[bot_counts >= threshold].index.tolist()
 
     return headers, footers
 
@@ -241,30 +238,58 @@ def extract_sections(body_lines: List[str]) -> List[Section]:
     """
     Parse body text into a list of Section objects based on detected headings.
     Lines before the first heading go into an 'Introduction' section.
+
+    Uses a vectorized pandas pipeline for large inputs:
+      1. Apply each heading regex to the whole Series at once (C-level loop).
+      2. cumsum() on the boolean heading mask assigns a section-ID to every line.
+      3. groupby(section_id) collects each section's lines in one pass.
     """
+    if not body_lines:
+        return [Section(title="Introduction", level=1, lines=[])]
+
+    s       = pd.Series(body_lines)
+    stripped = s.str.strip()
+
+    # Vectorized first-match-wins heading detection across all lines
+    heading_level   = pd.Series(0, index=s.index, dtype=int)
+    already_matched = pd.Series(False, index=s.index)
+    for lvl, pat in _HEADING_PATTERNS:
+        mask = (
+            (~already_matched)
+            & stripped.str.match(pat.pattern, na=False)
+            & stripped.ne("")
+        )
+        heading_level[mask] = lvl
+        already_matched    |= mask
+
+    is_heading = heading_level > 0
+
+    # section_id increments at each heading; pre-heading lines share id 0
+    section_id = is_heading.cumsum()
+
+    df = pd.DataFrame({
+        "line":          body_lines,
+        "stripped":      stripped,
+        "heading_level": heading_level,
+        "is_heading":    is_heading,
+        "section_id":    section_id,
+    })
+
     sections: List[Section] = []
-    current_title = "Introduction"
-    current_level = 1
-    current_lines: List[str] = []
-
-    for line in body_lines:
-        level = detect_heading(line)
-        if level is not None and line.strip():
-            # Save previous section
-            if current_lines or current_title != "Introduction":
-                sections.append(Section(title=current_title,
-                                        level=current_level,
-                                        lines=list(current_lines)))
-            current_title = line.strip().lstrip('#').strip()
-            current_level = level
-            current_lines = []
+    for _sid, grp in df.groupby("section_id", sort=True):
+        first = grp.iloc[0]
+        if first["is_heading"]:
+            title = first["stripped"].lstrip("#").strip()
+            level = int(first["heading_level"])
+            lines = grp.iloc[1:]["line"].tolist()
         else:
-            current_lines.append(line)
+            title = "Introduction"
+            level = 1
+            lines = grp["line"].tolist()
+        sections.append(Section(title=title, level=level, lines=lines))
 
-    # Save last section
-    sections.append(Section(title=current_title,
-                             level=current_level,
-                             lines=list(current_lines)))
+    if not sections:
+        sections.append(Section(title="Introduction", level=1, lines=body_lines))
 
     return sections
 
@@ -312,8 +337,45 @@ def parse_report(filename: str) -> ParsedReport:
 # 5.  DIFF UTILITIES
 # ---------------------------------------------------------------------------
 
+_PANDAS_THRESHOLD  = 10_000   # combined line count above which pandas path is used
+_MAX_TITLE_CMP_LEN = 500      # cap title length fed to SequenceMatcher
+
+
+def _line_diff_stats_pandas(lines_a: List[str], lines_b: List[str]) -> Dict:
+    """O(n+m) multiset hash-join diff stats via pandas.
+
+    Counts matching lines by frequency (Dice coefficient) rather than LCS order.
+    As a result, lines_changed is always 0 and similarity_ratio is a multiset
+    Dice score — both are close to the LCS values for typical report content.
+    """
+    cnt_a  = pd.Series(lines_a).value_counts()
+    cnt_b  = pd.Series(lines_b).value_counts()
+    idx    = cnt_a.index.intersection(cnt_b.index)
+    common = int(cnt_a[idx].combine(cnt_b[idx], min).sum()) if len(idx) else 0
+    added   = len(lines_b) - common
+    deleted = len(lines_a) - common
+    total   = max(len(lines_a), len(lines_b), 1)
+    denom   = len(lines_a) + len(lines_b)
+    ratio   = (2 * common / denom) if denom else 1.0
+    return {
+        "lines_added":      added,
+        "lines_deleted":    deleted,
+        "lines_changed":    0,
+        "lines_common":     common,
+        "similarity_ratio": round(ratio, 4),
+        "change_pct":       round((added + deleted) / total * 100, 2),
+    }
+
+
 def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
-    """Compute line-level diff stats between two lists of lines."""
+    """Compute line-level diff stats between two lists of lines.
+
+    Routes to pandas multiset hash-join (O(n+m)) for large inputs and falls
+    back to difflib SequenceMatcher exact LCS for small ones.
+    """
+    if len(lines_a) + len(lines_b) > _PANDAS_THRESHOLD:
+        return _line_diff_stats_pandas(lines_a, lines_b)
+
     matcher = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
     added = deleted = changed = common = 0
 
@@ -404,8 +466,8 @@ def match_sections(sections_a: List[Section],
 
     Returns a list of (section_a, section_b) pairs (None where unmatched).
     """
-    titles_a = [s.title.lower() for s in sections_a]
-    titles_b = [s.title.lower() for s in sections_b]
+    titles_a = [s.title.lower()[:_MAX_TITLE_CMP_LEN] for s in sections_a]
+    titles_b = [s.title.lower()[:_MAX_TITLE_CMP_LEN] for s in sections_b]
 
     matched: List[Tuple[Optional[Section], Optional[Section]]] = []
     used_b: set = set()
