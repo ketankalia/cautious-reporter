@@ -40,6 +40,7 @@ Dependencies:
 """
 
 import re
+import bisect
 import difflib
 import argparse
 import sys
@@ -337,16 +338,152 @@ def parse_report(filename: str) -> ParsedReport:
 # 5.  DIFF UTILITIES
 # ---------------------------------------------------------------------------
 
-_PANDAS_THRESHOLD  = 10_000   # combined line count above which pandas path is used
 _MAX_TITLE_CMP_LEN = 500      # cap title length fed to SequenceMatcher
 
 
-def _line_diff_stats_pandas(lines_a: List[str], lines_b: List[str]) -> Dict:
-    """O(n+m) multiset hash-join diff stats via pandas.
+def diff_opcodes(
+    lines_a: List[str], lines_b: List[str]
+) -> List[Tuple[str, int, int, int, int]]:
+    """Return difflib-style opcodes for two line sequences.
 
-    Counts matching lines by frequency (Dice coefficient) rather than LCS order.
-    As a result, lines_changed is always 0 and similarity_ratio is a multiset
-    Dice score — both are close to the LCS values for typical report content.
+    Uses pandas (line, rank) merge + patience-sort LIS instead of
+    SequenceMatcher — O(n log n) time and O(n) space at any file size.
+
+    The (line, rank) merge pairs the k-th occurrence of a line in A with
+    the k-th in B, so even files full of repeated lines produce at most
+    O(n) candidate matches before the LIS step.
+    """
+    if not lines_a and not lines_b:
+        return []
+    if not lines_a:
+        return [('insert', 0, 0, 0, len(lines_b))]
+    if not lines_b:
+        return [('delete', 0, len(lines_a), 0, 0)]
+
+    # Step 1 — assign in-order occurrence ranks (fully vectorised)
+    df_a = pd.DataFrame({'line': lines_a, 'pos_a': range(len(lines_a))})
+    df_a['rank'] = df_a.groupby('line', sort=False).cumcount()
+
+    df_b = pd.DataFrame({'line': lines_b, 'pos_b': range(len(lines_b))})
+    df_b['rank'] = df_b.groupby('line', sort=False).cumcount()
+
+    # Step 2 — merge on (line, rank) → valid in-order match pairs
+    matches = (
+        df_a.merge(df_b, on=['line', 'rank'])[['pos_a', 'pos_b']]
+        .sort_values('pos_a')
+        .reset_index(drop=True)
+    )
+
+    if matches.empty:
+        return [('replace', 0, len(lines_a), 0, len(lines_b))]
+
+    pos_a: List[int] = matches['pos_a'].tolist()
+    pos_b: List[int] = matches['pos_b'].tolist()
+
+    # Step 3 — LIS on pos_b (sorted by pos_a) via patience sort: O(n log n)
+    tails:      List[int] = []   # tails[i] = smallest pos_b ending IS of length i+1
+    tail_idx:   List[int] = []   # index into pos_b of that element
+    predecessor: List[int] = [-1] * len(pos_b)
+
+    for k, v in enumerate(pos_b):
+        ins = bisect.bisect_left(tails, v)
+        if ins == len(tails):
+            tails.append(v)
+            tail_idx.append(k)
+        else:
+            tails[ins] = v
+            tail_idx[ins] = k
+        if ins > 0:
+            predecessor[k] = tail_idx[ins - 1]
+
+    # Reconstruct LCS index list
+    lcs_indices: List[int] = []
+    k = tail_idx[-1] if tail_idx else -1
+    while k >= 0:
+        lcs_indices.append(k)
+        k = predecessor[k]
+    lcs_indices.reverse()
+
+    lcs_a = [pos_a[i] for i in lcs_indices]
+    lcs_b = [pos_b[i] for i in lcs_indices]
+
+    # Step 4 — merge consecutive adjacent LCS pairs into equal runs → opcodes
+    opcodes: List[Tuple[str, int, int, int, int]] = []
+    prev_a = prev_b = 0
+    i = 0
+    n = len(lcs_a)
+
+    while i < n:
+        run_s = i
+        while (i + 1 < n
+               and lcs_a[i + 1] == lcs_a[i] + 1
+               and lcs_b[i + 1] == lcs_b[i] + 1):
+            i += 1
+
+        ea_s, eb_s = lcs_a[run_s], lcs_b[run_s]
+        ea_e, eb_e = lcs_a[i] + 1, lcs_b[i] + 1
+
+        if ea_s > prev_a or eb_s > prev_b:
+            if ea_s > prev_a and eb_s > prev_b:
+                tag = 'replace'
+            elif ea_s > prev_a:
+                tag = 'delete'
+            else:
+                tag = 'insert'
+            opcodes.append((tag, prev_a, ea_s, prev_b, eb_s))
+
+        opcodes.append(('equal', ea_s, ea_e, eb_s, eb_e))
+        prev_a, prev_b = ea_e, eb_e
+        i += 1
+
+    if prev_a < len(lines_a) or prev_b < len(lines_b):
+        if prev_a < len(lines_a) and prev_b < len(lines_b):
+            tag = 'replace'
+        elif prev_a < len(lines_a):
+            tag = 'delete'
+        else:
+            tag = 'insert'
+        opcodes.append((tag, prev_a, len(lines_a), prev_b, len(lines_b)))
+
+    return opcodes
+
+
+def _grouped_opcodes(
+    opcodes: List[Tuple[str, int, int, int, int]], n: int = 3
+) -> List[List[Tuple[str, int, int, int, int]]]:
+    """Group opcodes into context-bounded hunks (port of SequenceMatcher.get_grouped_opcodes)."""
+    if not opcodes:
+        return []
+    codes = list(opcodes)
+    # Trim leading/trailing equal blocks to at most n lines
+    if codes[0][0] == 'equal':
+        tag, i1, i2, j1, j2 = codes[0]
+        codes[0] = tag, max(i1, i2 - n), i2, max(j1, j2 - n), j2
+    if codes[-1][0] == 'equal':
+        tag, i1, i2, j1, j2 = codes[-1]
+        codes[-1] = tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)
+
+    nn = n + n
+    groups = []
+    group: List[Tuple[str, int, int, int, int]] = []
+    for tag, i1, i2, j1, j2 in codes:
+        if tag == 'equal' and i2 - i1 > nn:
+            group.append((tag, i1, min(i2, i1 + n), j1, min(j2, j1 + n)))
+            groups.append(group)
+            group = []
+            i1, j1 = max(i1, i2 - n), max(j1, j2 - n)
+        group.append((tag, i1, i2, j1, j2))
+    if group and not (len(group) == 1 and group[0][0] == 'equal'):
+        groups.append(group)
+    return groups
+
+
+def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
+    """Compute line-level diff stats (pandas multiset hash-join, O(n+m)).
+
+    Uses value_counts() + index intersection to count matching lines by
+    frequency (Dice coefficient). Consistent at all input sizes — no
+    difflib recursion risk and no split-threshold inconsistency.
     """
     cnt_a  = pd.Series(lines_a).value_counts()
     cnt_b  = pd.Series(lines_b).value_counts()
@@ -360,43 +497,9 @@ def _line_diff_stats_pandas(lines_a: List[str], lines_b: List[str]) -> Dict:
     return {
         "lines_added":      added,
         "lines_deleted":    deleted,
-        "lines_changed":    0,
         "lines_common":     common,
         "similarity_ratio": round(ratio, 4),
         "change_pct":       round((added + deleted) / total * 100, 2),
-    }
-
-
-def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
-    """Compute line-level diff stats between two lists of lines.
-
-    Routes to pandas multiset hash-join (O(n+m)) for large inputs and falls
-    back to difflib SequenceMatcher exact LCS for small ones.
-    """
-    if len(lines_a) + len(lines_b) > _PANDAS_THRESHOLD:
-        return _line_diff_stats_pandas(lines_a, lines_b)
-
-    matcher = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
-    added = deleted = changed = common = 0
-
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == "equal":
-            common += (i2 - i1)
-        elif tag == "insert":
-            added += (j2 - j1)
-        elif tag == "delete":
-            deleted += (i2 - i1)
-        elif tag == "replace":
-            changed += max(i2 - i1, j2 - j1)
-
-    total = max(len(lines_a), len(lines_b), 1)
-    return {
-        "lines_added": added,
-        "lines_deleted": deleted,
-        "lines_changed": changed,
-        "lines_common": common,
-        "similarity_ratio": round(matcher.ratio(), 4),
-        "change_pct": round((added + deleted + changed) / total * 100, 2),
     }
 
 
@@ -404,13 +507,25 @@ def unified_diff_text(lines_a: List[str], lines_b: List[str],
                       label_a: str = "Report A",
                       label_b: str = "Report B",
                       context: int = 3) -> str:
-    """Return a unified diff string."""
-    diff = difflib.unified_diff(
-        lines_a, lines_b,
-        fromfile=label_a, tofile=label_b,
-        lineterm="", n=context
-    )
-    return "\n".join(diff)
+    """Return a unified diff string (pandas LCS engine; scales to any file size)."""
+    opcodes = diff_opcodes(lines_a, lines_b)
+    if not opcodes or all(op[0] == 'equal' for op in opcodes):
+        return ""
+
+    out = [f"--- {label_a}", f"+++ {label_b}"]
+    for group in _grouped_opcodes(opcodes, n=context):
+        i1, i2 = group[0][1], group[-1][2]
+        j1, j2 = group[0][3], group[-1][4]
+        out.append(f"@@ -{i1 + 1},{i2 - i1} +{j1 + 1},{j2 - j1} @@")
+        for tag, i1, i2, j1, j2 in group:
+            if tag == 'equal':
+                out.extend(' ' + ln for ln in lines_a[i1:i2])
+            else:
+                if tag in ('replace', 'delete'):
+                    out.extend('-' + ln for ln in lines_a[i1:i2])
+                if tag in ('replace', 'insert'):
+                    out.extend('+' + ln for ln in lines_b[j1:j2])
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
@@ -704,7 +819,6 @@ def format_report(result: ComparisonResult,
     c = result.content
     kv("Lines added:", c["lines_added"])
     kv("Lines deleted:", c["lines_deleted"])
-    kv("Lines changed:", c["lines_changed"])
     kv("Lines common:", c["lines_common"])
     kv("Similarity ratio:", c["similarity_ratio"])
     if "semantic_similarity" in c and c["semantic_similarity"] is not None:
@@ -730,11 +844,10 @@ def format_report(result: ComparisonResult,
             if sec.get("title_changed"):
                 lines.append(f"           Title changed → {sec['title_b']}")
             d = sec["diff"]
-            if d["lines_added"] or d["lines_deleted"] or d["lines_changed"]:
+            if d["lines_added"] or d["lines_deleted"]:
                 lines.append(
                     f"           +{d['lines_added']} added  "
-                    f"-{d['lines_deleted']} deleted  "
-                    f"~{d['lines_changed']} changed"
+                    f"-{d['lines_deleted']} deleted"
                 )
             if "semantic_similarity" in sec and sec["semantic_similarity"] is not None:
                 lines.append(f"           Semantic similarity: {sec['semantic_similarity']}")
