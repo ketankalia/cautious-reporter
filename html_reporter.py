@@ -39,6 +39,7 @@ from report_comparator import (
     scan_folder, match_filenames, compare_folder_pair,
     FolderMatchResult, FilePairOutcome,
     parse_report, compare_reports,
+    diff_opcodes,
 )
 
 BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
@@ -163,7 +164,7 @@ def file_link(label: str, url: str, name: str) -> str:
 
 
 def bcompare_button(bat_url: str, cmd_a: str, cmd_b: str, bcompare_exe: str) -> str:
-    cmd = f'{bcompare_exe} "{cmd_a}" "{cmd_b}"'a
+    cmd = f'{bcompare_exe} "{cmd_a}" "{cmd_b}"'
     esc = cmd.replace('"', '&quot;').replace("'", "&#39;")
     return (
         f'<div class="bc-row">'
@@ -218,7 +219,7 @@ def word_diff_inline(old: str, new: str) -> Tuple[str, str]:
 
 
 def build_diff_html(lines_a: List[str], lines_b: List[str],
-                    context: int = 3, max_lines: int = 2000) -> str:
+                    context: int = 3) -> str:
     """
     Build a unified-style HTML diff table.
 
@@ -226,13 +227,9 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
     Equal lines are shown collapsed when there are more than 2×context of them.
     For replace operations where both sides have equal line counts, word-level
     highlights are applied via word_diff_inline().
+    Uses the pandas LCS engine (diff_opcodes) — no line-count cap.
     """
-    truncated = len(lines_a) > max_lines or len(lines_b) > max_lines
-    lines_a = lines_a[:max_lines]
-    lines_b = lines_b[:max_lines]
-
-    sm      = difflib.SequenceMatcher(None, lines_a, lines_b, autojunk=False)
-    opcodes = sm.get_opcodes()
+    opcodes = diff_opcodes(lines_a, lines_b)
     rows: List[str] = []
     la = lb = 1   # running line-number counters
 
@@ -292,12 +289,6 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
                 for line in ins_lines:
                     rows.append(inserted(escape(line), lb)); lb += 1
 
-    if truncated:
-        rows.append(
-            f'<tr class="ds"><td colspan="3">'
-            f'⚠ Diff truncated — showing first {max_lines} lines per file</td></tr>'
-        )
-
     return (
         '<table class="diff-table">'
         '<colgroup>'
@@ -320,8 +311,7 @@ def sections_table(sections: List[dict]) -> str:
             ratio = sec["diff"]["similarity_ratio"]
             sim   = f"{ratio*100:.1f}%"
             chg   = (f'+{sec["diff"]["lines_added"]} '
-                     f'-{sec["diff"]["lines_deleted"]} '
-                     f'~{sec["diff"]["lines_changed"]}')
+                     f'-{sec["diff"]["lines_deleted"]}')
             status_badge = (
                 "IDENTICAL" if ratio >= 0.98 else
                 "MINOR"     if ratio >= 0.85 else
@@ -443,7 +433,6 @@ def pair_card(outcome: FilePairOutcome,
     <div class="stats-grid">
       {stat_box("Lines added",    ct["lines_added"],   "+")}
       {stat_box("Lines deleted",  ct["lines_deleted"],  "−")}
-      {stat_box("Lines changed",  ct["lines_changed"],  "~")}
       {stat_box("Lines common",   ct["lines_common"],   "=")}
       {stat_box("Change",         f'{ct["change_pct"]}%')}
       {stat_box("Pages A→B",      f'{st["page_count_a"]}→{st["page_count_b"]}')}
