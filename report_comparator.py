@@ -347,6 +347,7 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
 # ---------------------------------------------------------------------------
 
 _MAX_TITLE_CMP_LEN = 500      # cap title length fed to title similarity heuristics
+_MAX_EDIT_RATIO_LEN = 500    # cap strings passed to O(n*m) edit-distance DP
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _STOP_TOKENS = frozenset({
     "the", "and", "for", "with", "from", "into", "over", "under",
@@ -391,6 +392,9 @@ def _edit_ratio(a: str, b: str) -> float:
 def _string_similarity(a: str, b: str) -> float:
     a_norm = _normalize_title(a)
     b_norm = _normalize_title(b)
+    if len(a_norm) > _MAX_EDIT_RATIO_LEN or len(b_norm) > _MAX_EDIT_RATIO_LEN:
+        a_norm = a_norm[:_MAX_EDIT_RATIO_LEN]
+        b_norm = b_norm[:_MAX_EDIT_RATIO_LEN]
     return _edit_ratio(a_norm, b_norm)
 
 
@@ -992,22 +996,29 @@ def match_filenames(files_a: Dict[str, Path],
 
     # 2. Fuzzy matches
     if fuzzy and unmatched_a and unmatched_b:
-        # Build all candidate ratios
+        # Build all candidate ratios and keep only those above threshold.
         candidates: List[Tuple[float, str, str]] = []
         for ka in unmatched_a:
             for kb in unmatched_b:
                 ratio = _string_similarity(ka, kb)
-        used_b: Set[str] = set()
+                if ratio >= fuzzy_threshold:
+                    candidates.append((ratio, ka, kb))
 
-        for ratio, ka, kb in candidates:
-            if ka in used_a or kb in used_b:
-                continue
-            fuzzy_pairs.append((files_a[ka], files_b[kb], round(ratio, 4)))
-            used_a.add(ka)
-            used_b.add(kb)
+        if candidates:
+            candidates.sort(key=lambda item: item[0], reverse=True)
 
-        unmatched_a = [k for k in unmatched_a if k not in used_a]
-        unmatched_b = [k for k in unmatched_b if k not in used_b]
+            used_a: Set[str] = set()
+            used_b: Set[str] = set()
+
+            for ratio, ka, kb in candidates:
+                if ka in used_a or kb in used_b:
+                    continue
+                fuzzy_pairs.append((files_a[ka], files_b[kb], round(ratio, 4)))
+                used_a.add(ka)
+                used_b.add(kb)
+
+            unmatched_a = [k for k in unmatched_a if k not in used_a]
+            unmatched_b = [k for k in unmatched_b if k not in used_b]
 
     return FolderMatchResult(
         exact_pairs=exact_pairs,
