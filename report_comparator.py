@@ -10,6 +10,7 @@ SINGLE-FILE MODE
     python report_comparator.py report_a.txt report_b.txt
     python report_comparator.py report_a.txt report_b.txt --output diff.txt
     python report_comparator.py report_a.txt report_b.txt --semantic
+    python report_comparator.py report_a.txt report_b.txt --ignore-dates
 
 ─────────────────────────────────────────────
 FOLDER MODE  (pass two directory paths)
@@ -18,7 +19,8 @@ FOLDER MODE  (pass two directory paths)
     python report_comparator.py folder_a/ folder_b/ --output-dir results/
     python report_comparator.py folder_a/ folder_b/ --ext .txt --semantic
     python report_comparator.py folder_a/ folder_b/ --fuzzy-match
-    python report_comparator.py folder_a/ folder_b/ --no-diff --no-diff
+    python report_comparator.py folder_a/ folder_b/ --ignore-dates
+    python report_comparator.py folder_a/ folder_b/ --no-diff
 
 Folder mode produces:
   • One comparison file per matched pair  →  <output-dir>/<filename>_comparison.txt
@@ -49,6 +51,8 @@ import pandas as pd
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
+
+from date_utils import filter_lines
 
 
 # ---------------------------------------------------------------------------
@@ -299,7 +303,7 @@ def extract_sections(body_lines: List[str]) -> List[Section]:
 # 4.  REPORT PARSER
 # ---------------------------------------------------------------------------
 
-def parse_report(filename: str) -> ParsedReport:
+def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
     """Top-level parser: read file → pages → header/footer → sections."""
     try:
         with open(filename, "r", encoding="utf-8", errors="replace") as f:
@@ -328,6 +332,10 @@ def parse_report(filename: str) -> ParsedReport:
         report.pages.append(page)
         all_body_lines.extend(body)
 
+    # Filter dates if requested
+    if ignore_dates:
+        all_body_lines = filter_lines(all_body_lines)
+
     report.body_lines = all_body_lines
     report.sections = extract_sections(all_body_lines)
 
@@ -338,7 +346,52 @@ def parse_report(filename: str) -> ParsedReport:
 # 5.  DIFF UTILITIES
 # ---------------------------------------------------------------------------
 
-_MAX_TITLE_CMP_LEN = 500      # cap title length fed to SequenceMatcher
+_MAX_TITLE_CMP_LEN = 500      # cap title length fed to title similarity heuristics
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+_STOP_TOKENS = frozenset({
+    "the", "and", "for", "with", "from", "into", "over", "under",
+    "between", "that", "this", "these", "those", "have", "has",
+    "had", "are", "was", "were", "a", "an", "of", "in", "on",
+    "to", "by", "at", "as", "or", "if", "is"
+})
+
+
+def _normalize_title(text: str) -> str:
+    return " ".join(text.strip().lower().split())
+
+
+def _title_tokens(text: str) -> Set[str]:
+    tokens = [tok for tok in _TOKEN_RE.findall(text) if len(tok) > 1]
+    if not tokens:
+        return {text}
+    meaningful = [tok for tok in tokens if tok not in _STOP_TOKENS]
+    return set(meaningful or tokens)
+
+
+def _edit_ratio(a: str, b: str) -> float:
+    if a == b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    len_a, len_b = len(a), len(b)
+    if len_a < len_b:
+        a, b = b, a
+        len_a, len_b = len_b, len_a
+    prev_row = list(range(len_b + 1))
+    for i, ca in enumerate(a, start=1):
+        curr_row = [i]
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr_row.append(min(prev_row[j] + 1, curr_row[-1] + 1, prev_row[j - 1] + cost))
+        prev_row = curr_row
+    distance = prev_row[-1]
+    return 1.0 - (distance / max(len_a, len_b))
+
+
+def _string_similarity(a: str, b: str) -> float:
+    a_norm = _normalize_title(a)
+    b_norm = _normalize_title(b)
+    return _edit_ratio(a_norm, b_norm)
 
 
 def diff_opcodes(
@@ -566,23 +619,22 @@ def match_sections(sections_a: List[Section],
     """
     Match sections between two reports by title similarity.
 
-    Performance strategy (mirrors the pattern recommended in the difflib docs):
-      For each title in A we create ONE SequenceMatcher with seq1 fixed, then
-      iterate over candidates in B by calling set_seq2().  This lets difflib
-      cache the Junk-table and length analysis for seq1 across all B comparisons,
-      avoiding repeated object construction.
-
-      Two cheap upper-bound gates are checked before the full O(n·m) ratio():
-        1. real_quick_ratio() — O(1), based on lengths alone.
-        2. quick_ratio()      — O(n+m), based on a single common-char count.
-      Only pairs that survive both gates reach the expensive ratio() call,
-      reducing work from O(A·B) full computations to O(A·B) fast checks +
-      O(A · few) full computations in the typical case.
+    Performance strategy:
+      1. Normalize and tokenize section titles.
+      2. Build a reverse token index from B titles to reduce comparisons.
+      3. Only compare titles that share meaningful tokens.
+      4. Compute a custom normalized edit-distance ratio for short titles.
 
     Returns a list of (section_a, section_b) pairs (None where unmatched).
     """
-    titles_a = [s.title.lower()[:_MAX_TITLE_CMP_LEN] for s in sections_a]
-    titles_b = [s.title.lower()[:_MAX_TITLE_CMP_LEN] for s in sections_b]
+    titles_a = [s.title[:_MAX_TITLE_CMP_LEN] for s in sections_a]
+    titles_b = [s.title[:_MAX_TITLE_CMP_LEN] for s in sections_b]
+
+    title_tokens_b = [_title_tokens(t.lower()) for t in titles_b]
+    token_index: Dict[str, Set[int]] = {}
+    for j, tokens in enumerate(title_tokens_b):
+        for token in tokens:
+            token_index.setdefault(token, set()).add(j)
 
     matched: List[Tuple[Optional[Section], Optional[Section]]] = []
     used_b: set = set()
@@ -591,25 +643,19 @@ def match_sections(sections_a: List[Section],
         best_ratio = 0.0
         best_j = -1
 
-        # One matcher per outer title; seq2 is swapped cheaply via set_seq2()
-        matcher = difflib.SequenceMatcher(None, titles_a[i], "", autojunk=False)
+        tokens_a = _title_tokens(titles_a[i].lower())
+        candidate_indices: Set[int] = set()
+        for token in tokens_a:
+            candidate_indices.update(token_index.get(token, set()))
 
-        for j in range(len(sections_b)):
+        if not candidate_indices:
+            candidate_indices = set(range(len(sections_b)))
+
+        for j in candidate_indices:
             if j in used_b:
                 continue
 
-            matcher.set_seq2(titles_b[j])
-
-            # Gate 1 — O(1): pure length-based ceiling; skip if impossible to reach threshold
-            if matcher.real_quick_ratio() < threshold:
-                continue
-
-            # Gate 2 — O(n+m): common-char ceiling; eliminates more without full alignment
-            if matcher.quick_ratio() < threshold:
-                continue
-
-            # Gate 3 — full O(n·m) edit-distance ratio, reached only for close candidates
-            ratio = matcher.ratio()
+            ratio = _string_similarity(titles_a[i], titles_b[j])
             if ratio > best_ratio:
                 best_ratio = ratio
                 best_j = j
@@ -643,7 +689,10 @@ def compare_sections(sections_a: List[Section],
             entry["title_a"] = sec_a.title
             entry["title_b"] = sec_b.title
             entry["title_changed"] = sec_a.title.strip() != sec_b.title.strip()
-            diff = line_diff_stats(sec_a.lines, sec_b.lines)
+            # Filter out empty lines for fairer comparison
+            lines_a = [line for line in sec_a.lines if line.strip()]
+            lines_b = [line for line in sec_b.lines if line.strip()]
+            diff = line_diff_stats(lines_a, lines_b)
             entry["diff"] = diff
             if use_semantic:
                 entry["semantic_similarity"] = semantic_similarity(
@@ -700,11 +749,15 @@ def compare_reports(report_a: ParsedReport,
     }
 
     # -- Content (whole-body diff) --
-    content = line_diff_stats(report_a.body_lines, report_b.body_lines)
+    # Filter out empty lines that may result from date removal for fairer comparison
+    body_a = [line for line in report_a.body_lines if line.strip()]
+    body_b = [line for line in report_b.body_lines if line.strip()]
+    
+    content = line_diff_stats(body_a, body_b)
     if use_semantic:
         content["semantic_similarity"] = semantic_similarity(
-            "\n".join(report_a.body_lines),
-            "\n".join(report_b.body_lines)
+            "\n".join(body_a),
+            "\n".join(body_b)
         )
 
     # -- Section-level --
@@ -920,8 +973,9 @@ def match_filenames(files_a: Dict[str, Path],
     Strategy:
       1. Exact match  — identical filename (case-insensitive).
       2. Fuzzy match  — if --fuzzy-match is set, pair unmatched files whose
-                        names are similar enough (SequenceMatcher ratio ≥ threshold).
-                        Each file is paired at most once (greedy best-first).
+                        names are similar enough (custom normalized string
+                        similarity ≥ threshold). Each file is paired at most
+                        once (greedy best-first).
       3. Unmatched    — remainder go into only_in_a / only_in_b.
     """
     keys_a: Set[str] = set(files_a.keys())
@@ -942,13 +996,7 @@ def match_filenames(files_a: Dict[str, Path],
         candidates: List[Tuple[float, str, str]] = []
         for ka in unmatched_a:
             for kb in unmatched_b:
-                ratio = difflib.SequenceMatcher(None, ka, kb).ratio()
-                if ratio >= fuzzy_threshold:
-                    candidates.append((ratio, ka, kb))
-
-        # Sort descending by ratio and greedily assign
-        candidates.sort(key=lambda x: -x[0])
-        used_a: Set[str] = set()
+                ratio = _string_similarity(ka, kb)
         used_b: Set[str] = set()
 
         for ratio, ka, kb in candidates:
@@ -987,11 +1035,12 @@ def compare_folder_pair(path_a: Path,
                         path_b: Path,
                         match_type: str,
                         fuzzy_ratio: float,
-                        use_semantic: bool) -> FilePairOutcome:
+                        use_semantic: bool,
+                        ignore_dates: bool = False) -> FilePairOutcome:
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
-        ra = parse_report(str(path_a))
-        rb = parse_report(str(path_b))
+        ra = parse_report(str(path_a), ignore_dates=ignore_dates)
+        rb = parse_report(str(path_b), ignore_dates=ignore_dates)
         result = compare_reports(ra, rb, use_semantic=use_semantic)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result)
     except Exception as exc:
@@ -1006,7 +1055,8 @@ def run_folder_comparison(folder_a: Path,
                            fuzzy_threshold: float = 0.70,
                            use_semantic: bool = False,
                            output_dir: Optional[Path] = None,
-                           include_diff: bool = True) -> None:
+                           include_diff: bool = True,
+                           ignore_dates: bool = False) -> None:
     """
     Top-level folder comparison.  Scans both folders, matches files,
     runs per-file comparisons, writes individual reports, and writes
@@ -1036,16 +1086,16 @@ def run_folder_comparison(folder_a: Path,
 
     for pa, pb in match.exact_pairs:
         print(f"  Comparing [exact ] {pa.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic)
+        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates)
 
     for pa, pb, ratio in match.fuzzy_pairs:
         print(f"  Comparing [fuzzy ] {pa.name} ↔ {pb.name}  (name similarity {ratio:.0%})",
               file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic)
+        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates)
 
     # ---- Master summary ----
     summary_text = _format_folder_summary(
@@ -1062,7 +1112,8 @@ def run_folder_comparison(folder_a: Path,
 
 def _write_pair_report(outcome: FilePairOutcome,
                        output_dir: Optional[Path],
-                       include_diff: bool) -> None:
+                       include_diff: bool,
+                       ignore_dates: bool = False) -> None:
     """Write a single pair's comparison report to output_dir (or stdout)."""
     if outcome.error:
         text = (f"ERROR comparing {outcome.file_a.name} ↔ {outcome.file_b.name}\n"
@@ -1071,8 +1122,8 @@ def _write_pair_report(outcome: FilePairOutcome,
         ra = ParsedReport(filename=str(outcome.file_a))
         rb = ParsedReport(filename=str(outcome.file_b))
         # Re-parse to get full objects for the formatter
-        ra = parse_report(str(outcome.file_a))
-        rb = parse_report(str(outcome.file_b))
+        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates)
+        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates)
         text = format_report(outcome.result, ra, rb, include_diff=include_diff)
 
     if output_dir:
@@ -1244,6 +1295,8 @@ def main():
                         help="Enable TF-IDF semantic similarity (requires scikit-learn)")
     parser.add_argument("--no-diff", action="store_true",
                         help="Skip unified diff output (recommended for large files)")
+    parser.add_argument("--ignore-dates", action="store_true",
+                        help="Remove date/time patterns from comparison (ISO, US, timestamps, etc.)")
 
     # ---- single-file options ----
     parser.add_argument("--output", "-o",
@@ -1277,14 +1330,15 @@ def main():
             use_semantic=args.semantic,
             output_dir=output_dir,
             include_diff=not args.no_diff,
+            ignore_dates=args.ignore_dates,
         )
 
     # ------------------------------------------------------------------ FILE
     elif path_a.is_file() and path_b.is_file():
         print(f"Parsing  : {path_a}", file=sys.stderr)
-        report_a = parse_report(str(path_a))
+        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates)
         print(f"Parsing  : {path_b}", file=sys.stderr)
-        report_b = parse_report(str(path_b))
+        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates)
 
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
