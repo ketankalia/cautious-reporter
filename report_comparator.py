@@ -47,6 +47,7 @@ import difflib
 import argparse
 import sys
 import os
+import math
 import pandas as pd
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -346,8 +347,9 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
 # 5.  DIFF UTILITIES
 # ---------------------------------------------------------------------------
 
-_MAX_TITLE_CMP_LEN = 500      # cap title length fed to title similarity heuristics
+_MAX_TITLE_CMP_LEN  = 500     # cap title length fed to title similarity heuristics
 _MAX_EDIT_RATIO_LEN = 500    # cap strings passed to O(n*m) edit-distance DP
+_TITLE_TOP_K        = 10     # max candidates passed to O(n*m) edit DP per A-title
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 _STOP_TOKENS = frozenset({
     "the", "and", "for", "with", "from", "into", "over", "under",
@@ -617,48 +619,113 @@ def semantic_similarity(text_a: str, text_b: str) -> Optional[float]:
 # 7.  SECTION-AWARE COMPARISON
 # ---------------------------------------------------------------------------
 
+def _idf_weights(token_sets: List[Set[str]]) -> Dict[str, float]:
+    N = len(token_sets)
+    if N == 0:
+        return {}
+    df: Dict[str, int] = {}
+    for ts in token_sets:
+        for tok in ts:
+            df[tok] = df.get(tok, 0) + 1
+    # Smoothed IDF: high-frequency tokens (e.g. "SETTLEMENT" in every heading)
+    # get near-zero weight; rare discriminating tokens get high weight.
+    return {tok: math.log((1 + N) / (1 + cnt)) + 1.0 for tok, cnt in df.items()}
+
+
+def _title_cosine_candidates(
+    tokens_a: Set[str],
+    idf: Dict[str, float],
+    token_index: Dict[str, List[int]],
+    b_norms: List[float],
+    used_b: Set[int],
+) -> List[Tuple[float, int]]:
+    dot: Dict[int, float] = {}
+    w_a_sq = 0.0
+    for tok in tokens_a:
+        w = idf.get(tok, 1.0)
+        w_a_sq += w * w
+        for j in token_index.get(tok, []):
+            if j not in used_b:
+                dot[j] = dot.get(j, 0.0) + w * w
+    if not dot:
+        return []
+    norm_a = math.sqrt(w_a_sq)
+    out = []
+    for j, dv in dot.items():
+        nb = b_norms[j]
+        if nb > 0 and norm_a > 0:
+            out.append((dv / (norm_a * nb), j))
+    out.sort(reverse=True)
+    return out[:_TITLE_TOP_K]
+
+
 def match_sections(sections_a: List[Section],
                    sections_b: List[Section],
                    threshold: float = 0.6) -> List[Tuple[Optional[Section], Optional[Section]]]:
     """
     Match sections between two reports by title similarity.
 
-    Performance strategy:
-      1. Normalize and tokenize section titles.
-      2. Build a reverse token index from B titles to reduce comparisons.
-      3. Only compare titles that share meaningful tokens.
-      4. Compute a custom normalized edit-distance ratio for short titles.
+    Two-phase pipeline:
+      1. IDF-weighted cosine pre-filter narrows each A-title to at most
+         _TITLE_TOP_K B candidates. High-frequency shared tokens (e.g.
+         "SETTLEMENT") get near-zero IDF weight so they do not inflate
+         candidate sets — fixing the O(A*B) DP blowup when many headings
+         share a common prefix.
+      2. Exact edit-distance (_edit_ratio) runs only on those top-K candidates.
 
     Returns a list of (section_a, section_b) pairs (None where unmatched).
     """
+    if not sections_a and not sections_b:
+        return []
+
     titles_a = [s.title[:_MAX_TITLE_CMP_LEN] for s in sections_a]
     titles_b = [s.title[:_MAX_TITLE_CMP_LEN] for s in sections_b]
 
-    title_tokens_b = [_title_tokens(t.lower()) for t in titles_b]
-    token_index: Dict[str, Set[int]] = {}
-    for j, tokens in enumerate(title_tokens_b):
-        for token in tokens:
-            token_index.setdefault(token, set()).add(j)
+    normed_a = [_normalize_title(t) for t in titles_a]
+    normed_b = [_normalize_title(t) for t in titles_b]
+
+    token_sets_a = [_title_tokens(t) for t in normed_a]
+    token_sets_b = [_title_tokens(t) for t in normed_b]
+
+    idf = _idf_weights(token_sets_a + token_sets_b)
+
+    token_index: Dict[str, List[int]] = {}
+    for j, ts in enumerate(token_sets_b):
+        for tok in ts:
+            token_index.setdefault(tok, []).append(j)
+
+    b_norms: List[float] = [
+        math.sqrt(sum(idf.get(tok, 1.0) ** 2 for tok in ts))
+        for ts in token_sets_b
+    ]
 
     matched: List[Tuple[Optional[Section], Optional[Section]]] = []
-    used_b: set = set()
+    used_b: Set[int] = set()
 
     for i, sec_a in enumerate(sections_a):
+        # Phase 1: cosine pre-filter
+        cosine_top = _title_cosine_candidates(
+            token_sets_a[i], idf, token_index, b_norms, used_b
+        )
+        candidates = [j for _, j in cosine_top]
+
+        if not candidates:
+            # Fallback: rank all unused B by title-length ratio (O(B), no DP)
+            len_a = max(len(normed_a[i]), 1)
+            fallback = sorted(
+                (
+                    (min(len_a, max(len(normed_b[j]), 1)) /
+                     max(len_a, max(len(normed_b[j]), 1)), j)
+                    for j in range(len(sections_b)) if j not in used_b
+                ),
+                reverse=True,
+            )[:_TITLE_TOP_K]
+            candidates = [j for _, j in fallback]
+
+        # Phase 2: exact edit-distance on top-K only
         best_ratio = 0.0
         best_j = -1
-
-        tokens_a = _title_tokens(titles_a[i].lower())
-        candidate_indices: Set[int] = set()
-        for token in tokens_a:
-            candidate_indices.update(token_index.get(token, set()))
-
-        if not candidate_indices:
-            candidate_indices = set(range(len(sections_b)))
-
-        for j in candidate_indices:
-            if j in used_b:
-                continue
-
+        for j in candidates:
             ratio = _string_similarity(titles_a[i], titles_b[j])
             if ratio > best_ratio:
                 best_ratio = ratio
@@ -668,9 +735,8 @@ def match_sections(sections_a: List[Section],
             matched.append((sec_a, sections_b[best_j]))
             used_b.add(best_j)
         else:
-            matched.append((sec_a, None))      # section only in A
+            matched.append((sec_a, None))
 
-    # Sections only in B
     for j, sec_b in enumerate(sections_b):
         if j not in used_b:
             matched.append((None, sec_b))
