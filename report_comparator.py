@@ -97,6 +97,7 @@ class ComparisonResult:
     content: Dict
     sections: List[Dict]
     summary: Dict
+    page_comparisons: List[Dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +326,8 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
 
     for i, raw_lines in enumerate(raw_pages):
         h, body, f = strip_header_footer(raw_lines, global_headers, global_footers)
+        if ignore_dates:
+            body = filter_lines(body)
         page = Page(number=i + 1,
                     raw_lines=raw_lines,
                     header_lines=h,
@@ -332,10 +335,6 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
                     body_lines=body)
         report.pages.append(page)
         all_body_lines.extend(body)
-
-    # Filter dates if requested
-    if ignore_dates:
-        all_body_lines = filter_lines(all_body_lines)
 
     report.body_lines = all_body_lines
     report.sections = extract_sections(all_body_lines)
@@ -859,12 +858,51 @@ def compare_reports(report_a: ParsedReport,
         "verdict": _verdict(content["similarity_ratio"]),
     }
 
+    # -- Per-page comparison (only when at least one report has multiple pages) --
+    page_comparisons: List[Dict] = []
+    pages_a = report_a.pages
+    pages_b = report_b.pages
+
+    if len(pages_a) > 1 or len(pages_b) > 1:
+        n_matched = min(len(pages_a), len(pages_b))
+        for i in range(n_matched):
+            pg_body_a = [ln for ln in pages_a[i].body_lines if ln.strip()]
+            pg_body_b = [ln for ln in pages_b[i].body_lines if ln.strip()]
+            pg_diff = line_diff_stats(pg_body_a, pg_body_b)
+            pg_diff_text = unified_diff_text(
+                pg_body_a, pg_body_b,
+                label_a=f"A  page {i + 1}",
+                label_b=f"B  page {i + 1}",
+            )
+            page_comparisons.append({
+                "page_num_a": i + 1,
+                "page_num_b": i + 1,
+                "status": "matched",
+                "diff": pg_diff,
+                "diff_text": pg_diff_text,
+            })
+        for i in range(n_matched, len(pages_a)):
+            page_comparisons.append({
+                "page_num_a": i + 1,
+                "page_num_b": None,
+                "status": "removed",
+                "lines": len(pages_a[i].body_lines),
+            })
+        for i in range(n_matched, len(pages_b)):
+            page_comparisons.append({
+                "page_num_a": None,
+                "page_num_b": i + 1,
+                "status": "added",
+                "lines": len(pages_b[i].body_lines),
+            })
+
     return ComparisonResult(
         structural=structural,
         metadata=metadata,
         content=content,
         sections=section_results,
         summary=summary,
+        page_comparisons=page_comparisons,
     )
 
 
@@ -979,19 +1017,42 @@ def format_report(result: ComparisonResult,
         else:
             lines.append(f"  [REMOVED ] {sec['title_a']}  ({sec['lines']} lines)")
 
-    # Unified diff
+    # Diff section: per-page when available, otherwise whole-body
     if include_diff:
-        h("UNIFIED DIFF (body content)", "-")
-        diff_text = unified_diff_text(
-            report_a.body_lines,
-            report_b.body_lines,
-            label_a=report_a.filename,
-            label_b=report_b.filename,
-        )
-        if diff_text.strip():
-            lines.append(diff_text)
+        if result.page_comparisons:
+            h("PER-PAGE DIFF", "-")
+            for pc in result.page_comparisons:
+                if pc["status"] == "matched":
+                    lines.append("")
+                    lines.append(f"  {'─' * 56}")
+                    lines.append(f"  Page {pc['page_num_a']}  (A) vs  Page {pc['page_num_b']}  (B)")
+                    d = pc["diff"]
+                    lines.append(
+                        f"  Similarity: {d['similarity_ratio']:.1%}   "
+                        f"Change: {d['change_pct']:.1f}%   "
+                        f"+{d['lines_added']} / -{d['lines_deleted']} lines"
+                    )
+                    if pc["diff_text"].strip():
+                        lines.append(pc["diff_text"])
+                    else:
+                        lines.append("  (identical)")
+                elif pc["status"] == "added":
+                    lines.append("")
+                    lines.append(f"  [ADDED  ] Page {pc['page_num_b']} (only in B, {pc['lines']} lines)")
+                else:
+                    lines.append(f"  [REMOVED] Page {pc['page_num_a']} (only in A, {pc['lines']} lines)")
         else:
-            lines.append("  No differences in body content.")
+            h("UNIFIED DIFF (body content)", "-")
+            diff_text = unified_diff_text(
+                report_a.body_lines,
+                report_b.body_lines,
+                label_a=report_a.filename,
+                label_b=report_b.filename,
+            )
+            if diff_text.strip():
+                lines.append(diff_text)
+            else:
+                lines.append("  No differences in body content.")
 
     lines.append("")
     lines.append("=" * 60)
