@@ -18,6 +18,9 @@ Usage:
         --fuzzy-match --fuzzy-threshold 0.60 \\
         --bcompare "C:\\Program Files\\Beyond Compare 4\\BCompare.exe"
 
+    # Ignore date/time differences
+    python html_reporter.py folder_a/ folder_b/ --output results/report.html --ignore-dates
+
     # Extra file extensions
     python html_reporter.py folder_a/ folder_b/ --output results/report.html --ext .log
 """
@@ -814,7 +817,8 @@ def run(folder_a: Path, folder_b: Path,
         use_semantic: bool,
         linux_base: Optional[str],
         windows_base: Optional[str],
-        bcompare_exe: str) -> None:
+        bcompare_exe: str,
+        ignore_dates: bool = False) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -840,7 +844,7 @@ def run(folder_a: Path, folder_b: Path,
 
     for i, (pa, pb, mtype, mratio) in enumerate(all_pairs):
         print(f"  Comparing [{mtype:5}] {pa.name} ↔ {pb.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic)
+        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates)
         outcomes.append(outcome)
 
         win_a, url_a = resolve_paths(pa, linux_base, windows_base)
@@ -848,8 +852,8 @@ def run(folder_a: Path, folder_b: Path,
 
         # Parse body lines for diff rendering (headers/footers already stripped)
         try:
-            ra = parse_report(str(pa))
-            rb = parse_report(str(pb))
+            ra = parse_report(str(pa), ignore_dates=ignore_dates)
+            rb = parse_report(str(pb), ignore_dates=ignore_dates)
             body_a, body_b = ra.body_lines, rb.body_lines
         except Exception:
             body_a, body_b = [], []
@@ -896,6 +900,8 @@ def main():
                    help="Min name-similarity ratio for fuzzy match (default: 0.70)")
     p.add_argument("--semantic", action="store_true",
                    help="Enable TF-IDF semantic similarity (requires scikit-learn)")
+    p.add_argument("--ignore-dates", action="store_true",
+                   help="Remove date/time patterns from comparison (ISO, US, timestamps, etc.)")
     p.add_argument("--linux-base",
                    help="Linux absolute path of the outputs root (for path remapping)")
     p.add_argument("--windows-base",
@@ -917,6 +923,7 @@ def main():
         linux_base     = args.linux_base,
         windows_base   = args.windows_base,
         bcompare_exe   = args.bcompare,
+        ignore_dates   = args.ignore_dates,
     )
 
 
