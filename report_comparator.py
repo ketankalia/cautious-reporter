@@ -110,8 +110,8 @@ _PAGE_BREAK_PATTERNS = [
     r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',           # --- Page 3 ---
     r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',            # === Page 3 ===
     r'^\s*[Pp]age\s+\d+\s+of\s+\d+\s*$',           # Page 3 of 10
-    r'^\s*[-_]{10,}\s*$',                           # ──────────────
-    r'^\s*\*{10,}\s*$',                             # ************
+    r'^[-_]{10,}\s*$',                               # ──────────────  (must start at col 0)
+    r'^\*{10,}\s*$',                                 # ************   (must start at col 0)
 ]
 
 _PAGE_BREAK_RE = re.compile(
@@ -218,85 +218,45 @@ def strip_header_footer(page_lines: List[str],
 # 3.  SECTION DETECTOR
 # ---------------------------------------------------------------------------
 
-# Heading patterns in order of priority (level, pattern)
-_HEADING_PATTERNS: List[Tuple[int, re.Pattern]] = [
-    (1, re.compile(r'^#{1}\s+.+')),                         # # Heading
-    (2, re.compile(r'^#{2}\s+.+')),                         # ## Heading
-    (3, re.compile(r'^#{3}\s+.+')),                         # ### Heading
-    (1, re.compile(r'^[A-Z][A-Z\s\d\-:]{4,}$')),           # ALL CAPS LINE
-    (1, re.compile(r'^\d+\.\s+[A-Z].+')),                   # 1. Title
-    (2, re.compile(r'^\d+\.\d+\s+[A-Z].+')),                # 1.1 Sub-title
-    (3, re.compile(r'^\d+\.\d+\.\d+\s+.+')),                # 1.1.1 Sub-sub
-    (1, re.compile(r'^[A-Z].{0,60}\n[=]{3,}$')),            # Underline with ===
-    (2, re.compile(r'^[A-Z].{0,60}\n[-]{3,}$')),            # Underline with ---
-]
-
-
-def detect_heading(line: str) -> Optional[int]:
-    """Return heading level (1, 2, 3…) if line looks like a section heading, else None."""
-    stripped = line.strip()
-    for level, pattern in _HEADING_PATTERNS:
-        if pattern.match(stripped):
-            return level
-    return None
+# Matches "PAGE N", "Page N", or "page N" at the start of a line (captures the number)
+_PAGE_SECTION_RE = re.compile(r'^\s*[Pp][Aa][Gg][Ee]\s+(\d+)\b')
 
 
 def extract_sections(body_lines: List[str]) -> List[Section]:
     """
-    Parse body text into a list of Section objects based on detected headings.
-    Lines before the first heading go into an 'Introduction' section.
+    Split body text into sections by page markers ("PAGE N", "Page N", "page N").
+    Content before the first marker becomes "Page 0".
 
-    Uses a vectorized pandas pipeline for large inputs:
-      1. Apply each heading regex to the whole Series at once (C-level loop).
-      2. cumsum() on the boolean heading mask assigns a section-ID to every line.
+    Vectorized pipeline:
+      1. str.extract() applies the regex to every line at C speed.
+      2. cumsum() on the is_marker boolean assigns a section-ID to every line.
       3. groupby(section_id) collects each section's lines in one pass.
     """
     if not body_lines:
-        return [Section(title="Introduction", level=1, lines=[])]
+        return [Section(title="Page 0", level=1, lines=[])]
 
-    s       = pd.Series(body_lines)
-    stripped = s.str.strip()
-
-    # Vectorized first-match-wins heading detection across all lines
-    heading_level   = pd.Series(0, index=s.index, dtype=int)
-    already_matched = pd.Series(False, index=s.index)
-    for lvl, pat in _HEADING_PATTERNS:
-        mask = (
-            (~already_matched)
-            & stripped.str.match(pat.pattern, na=False)
-            & stripped.ne("")
-        )
-        heading_level[mask] = lvl
-        already_matched    |= mask
-
-    is_heading = heading_level > 0
-
-    # section_id increments at each heading; pre-heading lines share id 0
-    section_id = is_heading.cumsum()
+    s        = pd.Series(body_lines)
+    page_num = s.str.extract(_PAGE_SECTION_RE.pattern, expand=False)
+    is_marker = page_num.notna()
+    section_id = is_marker.cumsum()
 
     df = pd.DataFrame({
-        "line":          body_lines,
-        "stripped":      stripped,
-        "heading_level": heading_level,
-        "is_heading":    is_heading,
-        "section_id":    section_id,
+        "line":       body_lines,
+        "page_num":   page_num,
+        "is_marker":  is_marker,
+        "section_id": section_id,
     })
 
     sections: List[Section] = []
     for _sid, grp in df.groupby("section_id", sort=True):
         first = grp.iloc[0]
-        if first["is_heading"]:
-            title = first["stripped"].lstrip("#").strip()
-            level = int(first["heading_level"])
+        if first["is_marker"]:
+            title = f"Page {first['page_num']}"
             lines = grp.iloc[1:]["line"].tolist()
         else:
-            title = "Introduction"
-            level = 1
+            title = "Page 0"
             lines = grp["line"].tolist()
-        sections.append(Section(title=title, level=level, lines=lines))
-
-    if not sections:
-        sections.append(Section(title="Introduction", level=1, lines=body_lines))
+        sections.append(Section(title=title, level=1, lines=lines))
 
     return sections
 
