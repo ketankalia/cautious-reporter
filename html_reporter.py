@@ -355,6 +355,107 @@ def sections_table(sections: List[dict]) -> str:
     )
 
 
+def pages_panel(page_comparisons: List[dict],
+                per_page_lines: List[Tuple[List[str], List[str]]],
+                panel_id: str) -> Tuple[str, str]:
+    """Return (toggle_html, panel_html) for per-page comparison.
+    Returns ('', '') when there is nothing to show (single-page files).
+    """
+    if not page_comparisons:
+        return '', ''
+
+    rows: List[str] = []
+    diff_sections: List[str] = []
+    matched_idx = 0
+
+    for pc in page_comparisons:
+        if pc["status"] == "matched":
+            r = pc["diff"]["similarity_ratio"]
+            css = ("s-identical" if r >= 0.98 else
+                   "s-minor"     if r >= 0.85 else
+                   "s-moderate"  if r >= 0.60 else "s-significant")
+            badge = ("IDENTICAL" if r >= 0.98 else
+                     "MINOR"     if r >= 0.85 else
+                     "MODERATE"  if r >= 0.60 else "CHANGED")
+            sim = f"{r * 100:.1f}%"
+            chg = f'+{pc["diff"]["lines_added"]} −{pc["diff"]["lines_deleted"]}'
+
+            if r < 1.0 and matched_idx < len(per_page_lines):
+                diff_pid = f"{panel_id}-pd{matched_idx}"
+                la, lb = per_page_lines[matched_idx]
+                diff_cell = (
+                    f'<span class="card-toggle" onclick="toggle(this,\'{diff_pid}\')">'
+                    f'▶ diff</span>'
+                )
+                diff_sections.append(
+                    f'<div class="diff-wrap" id="{diff_pid}">'
+                    f'<div class="diff-toolbar">'
+                    f'  <span>Page {pc["page_num_a"]} — inline diff</span>'
+                    f'  <span class="diff-legend">'
+                    f'    <span class="dl-del">− removed</span>'
+                    f'    <span class="dl-chg">~ changed word</span>'
+                    f'    <span class="dl-ins">+ added</span>'
+                    f'  </span>'
+                    f'</div>'
+                    + build_diff_html(la, lb)
+                    + '</div>'
+                )
+            else:
+                diff_cell = '<span class="card-toggle no-diff">✓</span>'
+
+            matched_idx += 1
+            rows.append(
+                f'<tr class="{css}">'
+                f'<td>Page {pc["page_num_a"]}</td>'
+                f'<td><span class="badge {css}">{badge}</span></td>'
+                f'<td class="num">{sim}</td>'
+                f'<td class="num mono">{chg}</td>'
+                f'<td class="num">{diff_cell}</td>'
+                f'</tr>'
+            )
+        elif pc["status"] == "added":
+            rows.append(
+                f'<tr class="s-added">'
+                f'<td>Page {pc["page_num_b"]}</td>'
+                f'<td><span class="badge s-added">ADDED</span></td>'
+                f'<td class="num">—</td>'
+                f'<td class="num mono">{pc["lines"]} lines</td>'
+                f'<td></td>'
+                f'</tr>'
+            )
+        else:
+            rows.append(
+                f'<tr class="s-removed">'
+                f'<td>Page {pc["page_num_a"]}</td>'
+                f'<td><span class="badge s-removed">REMOVED</span></td>'
+                f'<td class="num">—</td>'
+                f'<td class="num mono">{pc["lines"]} lines</td>'
+                f'<td></td>'
+                f'</tr>'
+            )
+
+    table = (
+        '<table class="sec-table">'
+        '<thead><tr>'
+        '<th>Page</th><th>Status</th>'
+        '<th class="num">Similarity</th><th class="num">Changes</th><th></th>'
+        '</tr></thead>'
+        '<tbody>' + ''.join(rows) + '</tbody>'
+        '</table>'
+    )
+    panel = (
+        f'<div class="sec-detail" id="{panel_id}">'
+        + table
+        + ''.join(diff_sections)
+        + '</div>'
+    )
+    toggle = (
+        f'<span class="card-toggle" onclick="toggle(this,\'{panel_id}\')">'
+        f'▶ pages</span>'
+    )
+    return toggle, panel
+
+
 def pair_card(outcome: FilePairOutcome,
               bat_url: str,
               file_url_a: str,
@@ -364,7 +465,8 @@ def pair_card(outcome: FilePairOutcome,
               bcompare_exe: str,
               card_id: str,
               body_lines_a: List[str],
-              body_lines_b: List[str]) -> str:
+              body_lines_b: List[str],
+              per_page_lines: Optional[List[Tuple[List[str], List[str]]]] = None) -> str:
 
     if outcome.error:
         return (
@@ -389,6 +491,13 @@ def pair_card(outcome: FilePairOutcome,
 
     sec_id  = f"sec-{card_id}"
     diff_id = f"dif-{card_id}"
+    pg_id   = f"pg-{card_id}"
+
+    pages_toggle, pages_detail = pages_panel(
+        r.page_comparisons,
+        per_page_lines or [],
+        pg_id,
+    )
 
     # Build the diff panel (only when there are differences)
     if ratio < 1.0 and (body_lines_a or body_lines_b):
@@ -417,6 +526,7 @@ def pair_card(outcome: FilePairOutcome,
     <span class="badge {v_css}">{v_lbl}</span>
     <span class="card-title">{outcome.file_a.name}</span>
     {match_tag}
+    {pages_toggle}
     <span class="card-toggle" onclick="toggle(this,'{sec_id}')">▶ sections</span>
     {diff_toggle}
   </div>
@@ -446,6 +556,8 @@ def pair_card(outcome: FilePairOutcome,
 
   {"".join([f'<div class="hf-note">⚠ Header changed: {h}</div>' for h in r.metadata.get("headers_only_in_a", [])])}
   {"".join([f'<div class="hf-note hf-b">⚠ New header in B: {h}</div>' for h in r.metadata.get("headers_only_in_b", [])])}
+
+  {pages_detail}
 
   <div class="sec-detail" id="{sec_id}">
     <div class="sec-summary">
@@ -855,8 +967,15 @@ def run(folder_a: Path, folder_b: Path,
             ra = parse_report(str(pa), ignore_dates=ignore_dates)
             rb = parse_report(str(pb), ignore_dates=ignore_dates)
             body_a, body_b = ra.body_lines, rb.body_lines
+            n_matched = min(len(ra.pages), len(rb.pages))
+            per_page_lines = [
+                ([ln for ln in ra.pages[i].body_lines if ln.strip()],
+                 [ln for ln in rb.pages[i].body_lines if ln.strip()])
+                for i in range(n_matched)
+            ]
         except Exception:
             body_a, body_b = [], []
+            per_page_lines = []
 
         # Generate .bat launcher
         stem = pa.stem if mtype == "exact" else f"{pa.stem}_vs_{pb.stem}"
@@ -867,7 +986,7 @@ def run(folder_a: Path, folder_b: Path,
         card_id = f"card-{i}"
         cards_html += pair_card(outcome, bat_url, url_a, url_b,
                                  win_a, win_b, bcompare_exe, card_id,
-                                 body_a, body_b)
+                                 body_a, body_b, per_page_lines)
 
     unmatched_html = unmatched_section(match.only_in_a, match.only_in_b,
                                         linux_base, windows_base)
