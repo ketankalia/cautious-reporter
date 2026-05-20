@@ -41,7 +41,6 @@ sys.path.insert(0, str(Path(__file__).parent))
 from report_comparator import (
     scan_folder, match_filenames, compare_folder_pair,
     FolderMatchResult, FilePairOutcome,
-    parse_report, compare_reports,
     diff_opcodes,
 )
 
@@ -365,7 +364,6 @@ def pages_panel(page_comparisons: List[dict],
         return '', ''
 
     rows: List[str] = []
-    diff_sections: List[str] = []
     matched_idx = 0
 
     for pc in page_comparisons:
@@ -387,8 +385,10 @@ def pages_panel(page_comparisons: List[dict],
                     f'<span class="card-toggle" onclick="toggle(this,\'{diff_pid}\')">'
                     f'▶ diff</span>'
                 )
-                diff_sections.append(
-                    f'<div class="diff-wrap" id="{diff_pid}">'
+                diff_row = (
+                    f'<tr class="diff-row" id="{diff_pid}">'
+                    f'<td colspan="5">'
+                    f'<div class="diff-wrap open">'
                     f'<div class="diff-toolbar">'
                     f'  <span>Page {pc["page_num_a"]} — inline diff</span>'
                     f'  <span class="diff-legend">'
@@ -398,10 +398,11 @@ def pages_panel(page_comparisons: List[dict],
                     f'  </span>'
                     f'</div>'
                     + build_diff_html(la, lb)
-                    + '</div>'
+                    + '</div></td></tr>'
                 )
             else:
                 diff_cell = '<span class="card-toggle no-diff">✓</span>'
+                diff_row = ''
 
             matched_idx += 1
             rows.append(
@@ -412,6 +413,7 @@ def pages_panel(page_comparisons: List[dict],
                 f'<td class="num mono">{chg}</td>'
                 f'<td class="num">{diff_cell}</td>'
                 f'</tr>'
+                + diff_row
             )
         elif pc["status"] == "added":
             rows.append(
@@ -446,7 +448,6 @@ def pages_panel(page_comparisons: List[dict],
     panel = (
         f'<div class="sec-detail" id="{panel_id}">'
         + table
-        + ''.join(diff_sections)
         + '</div>'
     )
     toggle = (
@@ -744,6 +745,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 /* Diff panel */
 .diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;max-height:600px;overflow-y:auto}
 .diff-wrap.open{display:block}
+.diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
 .diff-toolbar{display:flex;justify-content:space-between;align-items:center;
               padding:6px 14px;background:#f9fafb;border-bottom:1px solid var(--border);
               font-size:12px;color:var(--muted);flex-wrap:wrap;gap:8px;position:sticky;top:0;z-index:1}
@@ -962,20 +964,9 @@ def run(folder_a: Path, folder_b: Path,
         win_a, url_a = resolve_paths(pa, linux_base, windows_base)
         win_b, url_b = resolve_paths(pb, linux_base, windows_base)
 
-        # Parse body lines for diff rendering (headers/footers already stripped)
-        try:
-            ra = parse_report(str(pa), ignore_dates=ignore_dates)
-            rb = parse_report(str(pb), ignore_dates=ignore_dates)
-            body_a, body_b = ra.body_lines, rb.body_lines
-            n_matched = min(len(ra.pages), len(rb.pages))
-            per_page_lines = [
-                ([ln for ln in ra.pages[i].body_lines if ln.strip()],
-                 [ln for ln in rb.pages[i].body_lines if ln.strip()])
-                for i in range(n_matched)
-            ]
-        except Exception:
-            body_a, body_b = [], []
-            per_page_lines = []
+        body_a = outcome.body_lines_a
+        body_b = outcome.body_lines_b
+        per_page_lines = outcome.per_page_lines
 
         # Generate .bat launcher
         stem = pa.stem if mtype == "exact" else f"{pa.stem}_vs_{pb.stem}"
