@@ -1127,6 +1127,9 @@ class FilePairOutcome:
     fuzzy_ratio: float        # name-similarity ratio (1.0 for exact)
     result: Optional[ComparisonResult]
     error: Optional[str] = None
+    body_lines_a: List[str] = field(default_factory=list)
+    body_lines_b: List[str] = field(default_factory=list)
+    per_page_lines: List[Tuple[List[str], List[str]]] = field(default_factory=list)
 
 
 def compare_folder_pair(path_a: Path,
@@ -1139,8 +1142,18 @@ def compare_folder_pair(path_a: Path,
     try:
         ra = parse_report(str(path_a), ignore_dates=ignore_dates)
         rb = parse_report(str(path_b), ignore_dates=ignore_dates)
+        body_a = [ln for ln in ra.body_lines if ln.strip()]
+        body_b = [ln for ln in rb.body_lines if ln.strip()]
+        n_matched = min(len(ra.pages), len(rb.pages))
+        per_page = [
+            ([ln for ln in ra.pages[i].body_lines if ln.strip()],
+             [ln for ln in rb.pages[i].body_lines if ln.strip()])
+            for i in range(n_matched)
+        ]
         result = compare_reports(ra, rb, use_semantic=use_semantic)
-        return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result)
+        return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
+                               body_lines_a=body_a, body_lines_b=body_b,
+                               per_page_lines=per_page)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
