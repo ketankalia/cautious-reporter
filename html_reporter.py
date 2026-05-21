@@ -110,14 +110,14 @@ def write_bcompare_bat(file_a: Path, file_b: Path,
 # ---------------------------------------------------------------------------
 
 def verdict_css(ratio: float) -> str:
-    if ratio >= 0.98: return "identical"
+    if ratio == 1.00: return "identical"
     if ratio >= 0.85: return "minor"
     if ratio >= 0.60: return "moderate"
     return "significant"
 
 
 def verdict_label(ratio: float) -> str:
-    if ratio >= 0.98: return "IDENTICAL"
+    if ratio == 1.00: return "IDENTICAL"
     if ratio >= 0.85: return "MINOR"
     if ratio >= 0.60: return "MODERATE"
     return "SIGNIFICANT"
@@ -127,7 +127,7 @@ def section_css(sec: dict) -> str:
     if sec["status"] == "added":   return "s-added"
     if sec["status"] == "removed": return "s-removed"
     r = sec.get("diff", {}).get("similarity_ratio", 1.0)
-    if r >= 0.98: return "s-identical"
+    if r == 1.00: return "s-identical"
     if r >= 0.85: return "s-minor"
     if r >= 0.60: return "s-moderate"
     return "s-significant"
@@ -315,7 +315,7 @@ def sections_table(sections: List[dict]) -> str:
             chg   = (f'+{sec["diff"]["lines_added"]} '
                      f'-{sec["diff"]["lines_deleted"]}')
             status_badge = (
-                "IDENTICAL" if ratio >= 0.98 else
+                "IDENTICAL" if ratio == 1.00 else
                 "MINOR"     if ratio >= 0.85 else
                 "MODERATE"  if ratio >= 0.60 else
                 "CHANGED"
@@ -369,10 +369,10 @@ def pages_panel(page_comparisons: List[dict],
     for pc in page_comparisons:
         if pc["status"] == "matched":
             r = pc["diff"]["similarity_ratio"]
-            css = ("s-identical" if r >= 0.98 else
+            css = ("s-identical" if r == 1.00 else
                    "s-minor"     if r >= 0.85 else
                    "s-moderate"  if r >= 0.60 else "s-significant")
-            badge = ("IDENTICAL" if r >= 0.98 else
+            badge = ("IDENTICAL" if r == 1.00 else
                      "MINOR"     if r >= 0.85 else
                      "MODERATE"  if r >= 0.60 else "CHANGED")
             sim = f"{r * 100:.1f}%"
@@ -490,7 +490,6 @@ def pair_card(outcome: FilePairOutcome,
         if outcome.match_type == "fuzzy" else ""
     )
 
-    sec_id  = f"sec-{card_id}"
     diff_id = f"dif-{card_id}"
     pg_id   = f"pg-{card_id}"
 
@@ -528,7 +527,6 @@ def pair_card(outcome: FilePairOutcome,
     <span class="card-title">{outcome.file_a.name}</span>
     {match_tag}
     {pages_toggle}
-    <span class="card-toggle" onclick="toggle(this,'{sec_id}')">▶ sections</span>
     {diff_toggle}
   </div>
 
@@ -559,17 +557,6 @@ def pair_card(outcome: FilePairOutcome,
   {"".join([f'<div class="hf-note hf-b">⚠ New header in B: {h}</div>' for h in r.metadata.get("headers_only_in_b", [])])}
 
   {pages_detail}
-
-  <div class="sec-detail" id="{sec_id}">
-    <div class="sec-summary">
-      {stat_box("Matched",   sm["sections_matched"])}
-      {stat_box("Changed",   sm["sections_with_changes"])}
-      {stat_box("Identical", sm["sections_identical"])}
-      {stat_box("Added",     sm["sections_added"])}
-      {stat_box("Removed",   sm["sections_removed"])}
-    </div>
-    {sections_table(r.sections)}
-  </div>
 
   {diff_panel}
 
@@ -827,8 +814,8 @@ def build_html(folder_a: Path, folder_b: Path,
     scores = [o.result.summary["overall_similarity_ratio"] for o in ok]
     avg   = (sum(scores) / len(scores) * 100) if scores else 0
     counts = {
-        "identical":   sum(1 for r in scores if r >= 0.98),
-        "minor":       sum(1 for r in scores if 0.85 <= r < 0.98),
+        "identical":   sum(1 for r in scores if r == 1.00),
+        "minor":       sum(1 for r in scores if 0.85 <= r <= 0.99),
         "moderate":    sum(1 for r in scores if 0.60 <= r < 0.85),
         "significant": sum(1 for r in scores if r < 0.60),
     }
