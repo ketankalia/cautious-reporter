@@ -67,6 +67,7 @@ class Page:
     header_lines: List[str] = field(default_factory=list)
     footer_lines: List[str] = field(default_factory=list)
     body_lines: List[str] = field(default_factory=list)
+    body_line_numbers: List[int] = field(default_factory=list)  # 1-based raw file position
 
 
 @dataclass
@@ -74,6 +75,7 @@ class Section:
     title: str
     level: int          # 1 = top-level, 2 = sub-section, etc.
     lines: List[str] = field(default_factory=list)
+    line_numbers: List[int] = field(default_factory=list)   # 1-based raw file position
 
     @property
     def text(self) -> str:
@@ -88,6 +90,7 @@ class ParsedReport:
     global_header: List[str] = field(default_factory=list)   # repeating header
     global_footer: List[str] = field(default_factory=list)   # repeating footer
     body_lines: List[str] = field(default_factory=list)      # all body text (flat)
+    body_line_numbers: List[int] = field(default_factory=list)  # 1-based raw file position per body line
 
 
 @dataclass
@@ -106,6 +109,7 @@ class ComparisonResult:
 
 # Common page-break patterns in text reports
 _PAGE_BREAK_PATTERNS = [
+    r'^\s*PAGE\s+\d+\s*$',                             # PAGE 1 / PAGE  2
     r'\f',                                          # form-feed character
     r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',           # --- Page 3 ---
     r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',            # === Page 3 ===
@@ -222,7 +226,7 @@ def strip_header_footer(page_lines: List[str],
 _PAGE_SECTION_RE = re.compile(r'^\s*[Pp][Aa][Gg][Ee]\s+(\d+)\b')
 
 
-def extract_sections(body_lines: List[str]) -> List[Section]:
+def extract_sections(body_lines: List[str], body_line_numbers: List[int] = None) -> List[Section]:
     """
     Split body text into sections by page markers ("PAGE N", "Page N", "page N").
     Content before the first marker becomes "Page 0".
@@ -252,11 +256,13 @@ def extract_sections(body_lines: List[str]) -> List[Section]:
         first = grp.iloc[0]
         if first["is_marker"]:
             title = f"Page {first['page_num']}"
-            lines = grp.iloc[1:]["line"].tolist()
+            sub = grp.iloc[1:]
         else:
             title = "Page 0"
-            lines = grp["line"].tolist()
-        sections.append(Section(title=title, level=1, lines=lines))
+            sub = grp
+        lines = sub["line"].tolist()
+        nums = [body_line_numbers[i] for i in sub.index] if body_line_numbers else []
+        sections.append(Section(title=title, level=1, lines=lines, line_numbers=nums))
 
     return sections
 
@@ -282,22 +288,41 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
     report.global_header = global_headers
     report.global_footer = global_footers
 
+    # Forward-scan tracker: maps each body line to its 1-based position in the raw file.
+    # Scanning forward ensures correctness even when the same text appears on multiple pages.
+    raw_text_lines = text.replace("\r\n", "\n").replace("\r", "\n").split('\n')
+    _scan_pos = 0
+
+    def _raw_line_num(line_text: str) -> int:
+        nonlocal _scan_pos
+        for j in range(_scan_pos, len(raw_text_lines)):
+            if raw_text_lines[j] == line_text:
+                _scan_pos = j + 1
+                return j + 1
+        return _scan_pos  # fallback: shouldn't normally be reached
+
     all_body_lines: List[str] = []
+    all_body_line_nums: List[int] = []
 
     for i, raw_lines in enumerate(raw_pages):
         h, body, f = strip_header_footer(raw_lines, global_headers, global_footers)
+        # Compute positions against the pre-mask body so they match the raw file
+        page_nums = [_raw_line_num(ln) for ln in body]
         if ignore_dates:
             body = filter_lines(body)
         page = Page(number=i + 1,
                     raw_lines=raw_lines,
                     header_lines=h,
                     footer_lines=f,
-                    body_lines=body)
+                    body_lines=body,
+                    body_line_numbers=page_nums)
         report.pages.append(page)
         all_body_lines.extend(body)
+        all_body_line_nums.extend(page_nums)
 
     report.body_lines = all_body_lines
-    report.sections = extract_sections(all_body_lines)
+    report.body_line_numbers = all_body_line_nums
+    report.sections = extract_sections(all_body_lines, all_body_line_nums)
 
     return report
 
@@ -718,9 +743,17 @@ def compare_sections(sections_a: List[Section],
             entry["title_a"] = sec_a.title
             entry["title_b"] = sec_b.title
             entry["title_changed"] = sec_a.title.strip() != sec_b.title.strip()
-            # Filter out empty lines for fairer comparison
-            lines_a = [line for line in sec_a.lines if line.strip()]
-            lines_b = [line for line in sec_b.lines if line.strip()]
+            # Filter out empty lines for fairer comparison; track raw file positions in parallel
+            a_nums = sec_a.line_numbers or [0] * len(sec_a.lines)
+            b_nums = sec_b.line_numbers or [0] * len(sec_b.lines)
+            lines_a_pairs = [(l, n) for l, n in zip(sec_a.lines, a_nums) if l.strip()]
+            lines_b_pairs = [(l, n) for l, n in zip(sec_b.lines, b_nums) if l.strip()]
+            lines_a = [l for l, _ in lines_a_pairs]
+            lines_b = [l for l, _ in lines_b_pairs]
+            entry["lines_a"] = lines_a
+            entry["lines_b"] = lines_b
+            entry["line_numbers_a"] = [n for _, n in lines_a_pairs]
+            entry["line_numbers_b"] = [n for _, n in lines_b_pairs]
             diff = line_diff_stats(lines_a, lines_b)
             entry["diff"] = diff
             if use_semantic:
@@ -731,10 +764,12 @@ def compare_sections(sections_a: List[Section],
             entry["status"] = "removed"
             entry["title_a"] = sec_a.title
             entry["lines"] = len(sec_a.lines)
+            entry["lines_filtered"] = len([l for l in sec_a.lines if l.strip()])
         else:
             entry["status"] = "added"
             entry["title_b"] = sec_b.title
             entry["lines"] = len(sec_b.lines)
+            entry["lines_filtered"] = len([l for l in sec_b.lines if l.strip()])
 
         results.append(entry)
 
@@ -1129,7 +1164,10 @@ class FilePairOutcome:
     error: Optional[str] = None
     body_lines_a: List[str] = field(default_factory=list)
     body_lines_b: List[str] = field(default_factory=list)
+    body_line_numbers_a: List[int] = field(default_factory=list)
+    body_line_numbers_b: List[int] = field(default_factory=list)
     per_page_lines: List[Tuple[List[str], List[str]]] = field(default_factory=list)
+    per_page_line_numbers: List[Tuple[List[int], List[int]]] = field(default_factory=list)
 
 
 def compare_folder_pair(path_a: Path,
@@ -1142,18 +1180,25 @@ def compare_folder_pair(path_a: Path,
     try:
         ra = parse_report(str(path_a), ignore_dates=ignore_dates)
         rb = parse_report(str(path_b), ignore_dates=ignore_dates)
-        body_a = [ln for ln in ra.body_lines if ln.strip()]
-        body_b = [ln for ln in rb.body_lines if ln.strip()]
+
+        def _filter(lines: List[str], nums: List[int]):
+            pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
+            return [l for l, _ in pairs], [n for _, n in pairs]
+
+        body_a, nums_a = _filter(ra.body_lines, ra.body_line_numbers)
+        body_b, nums_b = _filter(rb.body_lines, rb.body_line_numbers)
         n_matched = min(len(ra.pages), len(rb.pages))
-        per_page = [
-            ([ln for ln in ra.pages[i].body_lines if ln.strip()],
-             [ln for ln in rb.pages[i].body_lines if ln.strip()])
-            for i in range(n_matched)
-        ]
+        per_page, per_page_nums = [], []
+        for i in range(n_matched):
+            pla, pna = _filter(ra.pages[i].body_lines, ra.pages[i].body_line_numbers)
+            plb, pnb = _filter(rb.pages[i].body_lines, rb.pages[i].body_line_numbers)
+            per_page.append((pla, plb))
+            per_page_nums.append((pna, pnb))
         result = compare_reports(ra, rb, use_semantic=use_semantic)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
                                body_lines_a=body_a, body_lines_b=body_b,
-                               per_page_lines=per_page)
+                               body_line_numbers_a=nums_a, body_line_numbers_b=nums_b,
+                               per_page_lines=per_page, per_page_line_numbers=per_page_nums)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
