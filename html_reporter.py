@@ -221,7 +221,9 @@ def word_diff_inline(old: str, new: str) -> Tuple[str, str]:
 
 
 def build_diff_html(lines_a: List[str], lines_b: List[str],
-                    context: int = 3) -> str:
+                    context: int = 3,
+                    line_nums_a: Optional[List[int]] = None,
+                    line_nums_b: Optional[List[int]] = None) -> str:
     """
     Build a unified-style HTML diff table.
 
@@ -230,21 +232,25 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
     For replace operations where both sides have equal line counts, word-level
     highlights are applied via word_diff_inline().
     Uses the pandas LCS engine (diff_opcodes) — no line-count cap.
+    line_nums_a / line_nums_b: raw file line numbers for each element of lines_a / lines_b;
+    when provided, those numbers are shown; otherwise 1-based sequential.
     """
     opcodes = diff_opcodes(lines_a, lines_b)
     rows: List[str] = []
-    la = lb = 1   # running line-number counters
 
-    def ctx(line: str, a: int, b: int) -> str:
-        return (f'<tr class="dc"><td class="ln">{a}</td><td class="ln">{b}</td>'
+    def lna(i: int) -> int: return line_nums_a[i] if line_nums_a else i + 1
+    def lnb(j: int) -> int: return line_nums_b[j] if line_nums_b else j + 1
+
+    def ctx(line: str, i: int, j: int) -> str:
+        return (f'<tr class="dc"><td class="ln">{lna(i)}</td><td class="ln">{lnb(j)}</td>'
                 f'<td class="dx"> {escape(line)}</td></tr>')
 
-    def deleted(html_line: str, a: int) -> str:
-        return (f'<tr class="dd"><td class="ln">{a}</td><td class="ln"></td>'
+    def deleted(html_line: str, i: int) -> str:
+        return (f'<tr class="dd"><td class="ln">{lna(i)}</td><td class="ln"></td>'
                 f'<td class="dx">−&nbsp;{html_line}</td></tr>')
 
-    def inserted(html_line: str, b: int) -> str:
-        return (f'<tr class="di"><td class="ln"></td><td class="ln">{b}</td>'
+    def inserted(html_line: str, j: int) -> str:
+        return (f'<tr class="di"><td class="ln"></td><td class="ln">{lnb(j)}</td>'
                 f'<td class="dx">+&nbsp;{html_line}</td></tr>')
 
     def skipped(n: int) -> str:
@@ -253,43 +259,38 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
 
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == 'equal':
-            block = lines_a[i1:i2]
-            n = len(block)
+            n = i2 - i1
             if n <= 2 * context:
-                for line in block:
-                    rows.append(ctx(line, la, lb)); la += 1; lb += 1
+                for k in range(n):
+                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
             else:
-                for line in block[:context]:
-                    rows.append(ctx(line, la, lb)); la += 1; lb += 1
-                skipped_n = n - 2 * context
-                rows.append(skipped(skipped_n))
-                la += skipped_n; lb += skipped_n
-                for line in block[n - context:]:
-                    rows.append(ctx(line, la, lb)); la += 1; lb += 1
+                for k in range(context):
+                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
+                rows.append(skipped(n - 2 * context))
+                for k in range(n - context, n):
+                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
 
         elif tag == 'insert':
-            for line in lines_b[j1:j2]:
-                rows.append(inserted(escape(line), lb)); lb += 1
+            for k in range(j2 - j1):
+                rows.append(inserted(escape(lines_b[j1 + k]), j1 + k))
 
         elif tag == 'delete':
-            for line in lines_a[i1:i2]:
-                rows.append(deleted(escape(line), la)); la += 1
+            for k in range(i2 - i1):
+                rows.append(deleted(escape(lines_a[i1 + k]), i1 + k))
 
         elif tag == 'replace':
             del_lines = lines_a[i1:i2]
             ins_lines = lines_b[j1:j2]
             if len(del_lines) == len(ins_lines):
-                # Pair lines 1-to-1 and apply word-level highlighting
-                for old, new in zip(del_lines, ins_lines):
+                for k, (old, new) in enumerate(zip(del_lines, ins_lines)):
                     old_html, new_html = word_diff_inline(old, new)
-                    rows.append(deleted(old_html, la));   la += 1
-                    rows.append(inserted(new_html, lb));  lb += 1
+                    rows.append(deleted(old_html, i1 + k))
+                    rows.append(inserted(new_html, j1 + k))
             else:
-                # Unequal block sizes — show raw del block then ins block
-                for line in del_lines:
-                    rows.append(deleted(escape(line), la)); la += 1
-                for line in ins_lines:
-                    rows.append(inserted(escape(line), lb)); lb += 1
+                for k, line in enumerate(del_lines):
+                    rows.append(deleted(escape(line), i1 + k))
+                for k, line in enumerate(ins_lines):
+                    rows.append(inserted(escape(line), j1 + k))
 
     return (
         '<table class="diff-table">'
@@ -356,12 +357,51 @@ def sections_table(sections: List[dict]) -> str:
 
 def pages_panel(page_comparisons: List[dict],
                 per_page_lines: List[Tuple[List[str], List[str]]],
-                panel_id: str) -> Tuple[str, str]:
+                panel_id: str,
+                per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None) -> Tuple[str, str]:
     """Return (toggle_html, panel_html) for per-page comparison.
     Returns ('', '') when there is nothing to show (single-page files).
+    per_page_line_numbers: raw file line numbers parallel to per_page_lines; when provided,
+    passed to build_diff_html so numbers match actual file positions.
     """
     if not page_comparisons:
         return '', ''
+
+    # Pre-count statuses for the filter bar
+    status_counts: dict = {}
+    for pc in page_comparisons:
+        if pc["status"] == "matched":
+            r = pc["diff"]["similarity_ratio"]
+            k = ("s-identical" if r == 1.00 else
+                 "s-minor"     if r >= 0.85 else
+                 "s-moderate"  if r >= 0.60 else "s-significant")
+        elif pc["status"] == "added":
+            k = "s-added"
+        else:
+            k = "s-removed"
+        status_counts[k] = status_counts.get(k, 0) + 1
+
+    _STATUS_META = [
+        ("s-identical",   "Identical"),
+        ("s-minor",       "Minor"),
+        ("s-moderate",    "Moderate"),
+        ("s-significant", "Changed"),
+        ("s-added",       "Added"),
+        ("s-removed",     "Removed"),
+    ]
+    total_pages = sum(status_counts.values())
+    filter_btns = (
+        f'<button class="pf-btn pf-all active" onclick="setPageFilter(\'{panel_id}\',\'all\')">'
+        f'All&nbsp;({total_pages})</button>'
+    )
+    for css_key, label in _STATUS_META:
+        cnt = status_counts.get(css_key, 0)
+        if cnt:
+            filter_btns += (
+                f'<button class="pf-btn pf-{css_key}" onclick="setPageFilter(\'{panel_id}\',\'{css_key}\')">'
+                f'<span class="pf-dot {css_key}"></span>{label}&nbsp;({cnt})</button>'
+            )
+    filter_bar = f'<div class="pg-filter-bar">{filter_btns}</div>'
 
     rows: List[str] = []
     matched_idx = 0
@@ -378,9 +418,22 @@ def pages_panel(page_comparisons: List[dict],
             sim = f"{r * 100:.1f}%"
             chg = f'+{pc["diff"]["lines_added"]} −{pc["diff"]["lines_deleted"]}'
 
+            if per_page_line_numbers and matched_idx < len(per_page_line_numbers):
+                _rng_a, _rng_b = per_page_line_numbers[matched_idx]
+                _ra = f'L{_rng_a[0]}–{_rng_a[-1]}' if _rng_a else ''
+                _rb = f'L{_rng_b[0]}–{_rng_b[-1]}' if _rng_b else ''
+                _lnr = f' / '.join(x for x in [_ra, _rb] if x)
+                ln_hint = f'<br><span class="pg-lnr">{_lnr}</span>' if _lnr else ''
+            else:
+                ln_hint = ''
+
             if r < 1.0 and matched_idx < len(per_page_lines):
                 diff_pid = f"{panel_id}-pd{matched_idx}"
                 la, lb = per_page_lines[matched_idx]
+                if per_page_line_numbers and matched_idx < len(per_page_line_numbers):
+                    la_nums, lb_nums = per_page_line_numbers[matched_idx]
+                else:
+                    la_nums, lb_nums = None, None
                 diff_cell = (
                     f'<span class="card-toggle" onclick="toggle(this,\'{diff_pid}\')">'
                     f'▶ diff</span>'
@@ -397,7 +450,7 @@ def pages_panel(page_comparisons: List[dict],
                     f'    <span class="dl-ins">+ added</span>'
                     f'  </span>'
                     f'</div>'
-                    + build_diff_html(la, lb)
+                    + build_diff_html(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums)
                     + '</div></td></tr>'
                 )
             else:
@@ -407,7 +460,7 @@ def pages_panel(page_comparisons: List[dict],
             matched_idx += 1
             rows.append(
                 f'<tr class="{css}">'
-                f'<td>Page {pc["page_num_a"]}</td>'
+                f'<td>Page {pc["page_num_a"]}{ln_hint}</td>'
                 f'<td><span class="badge {css}">{badge}</span></td>'
                 f'<td class="num">{sim}</td>'
                 f'<td class="num mono">{chg}</td>'
@@ -447,6 +500,7 @@ def pages_panel(page_comparisons: List[dict],
     )
     panel = (
         f'<div class="sec-detail" id="{panel_id}">'
+        + filter_bar
         + table
         + '</div>'
     )
@@ -455,6 +509,9 @@ def pages_panel(page_comparisons: List[dict],
         f'▶ pages</span>'
     )
     return toggle, panel
+
+
+
 
 
 def pair_card(outcome: FilePairOutcome,
@@ -493,11 +550,42 @@ def pair_card(outcome: FilePairOutcome,
     diff_id = f"dif-{card_id}"
     pg_id   = f"pg-{card_id}"
 
-    pages_toggle, pages_detail = pages_panel(
-        r.page_comparisons,
-        per_page_lines or [],
-        pg_id,
-    )
+    eff_pcs = r.page_comparisons
+    eff_ppl = per_page_lines or []
+    eff_pln: Optional[List[Tuple[List[int], List[int]]]] = outcome.per_page_line_numbers or None
+
+    if not eff_pcs and r.sections:
+        eff_pcs = []
+        eff_ppl = []
+        eff_pln = []
+        for sec in r.sections:
+            title_a = sec.get("title_a", sec.get("title_b", "Page 0"))
+            title_b = sec.get("title_b", sec.get("title_a", "Page 0"))
+            try:
+                pnum_a = int(title_a.rsplit(None, 1)[-1])
+            except (ValueError, IndexError):
+                pnum_a = 0
+            try:
+                pnum_b = int(title_b.rsplit(None, 1)[-1])
+            except (ValueError, IndexError):
+                pnum_b = 0
+            if sec["status"] == "matched":
+                la = sec.get("lines_a", [])
+                lb = sec.get("lines_b", [])
+                la_nums = sec.get("line_numbers_a", [])
+                lb_nums = sec.get("line_numbers_b", [])
+                eff_pcs.append({"status": "matched", "page_num_a": pnum_a,
+                                "page_num_b": pnum_b, "diff": sec["diff"]})
+                eff_ppl.append((la, lb))
+                eff_pln.append((la_nums, lb_nums))
+            elif sec["status"] == "removed":
+                eff_pcs.append({"status": "removed", "page_num_a": pnum_a,
+                                "page_num_b": None, "lines": sec["lines"]})
+            else:
+                eff_pcs.append({"status": "added", "page_num_a": None,
+                                "page_num_b": pnum_b, "lines": sec["lines"]})
+
+    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln)
 
     # Build the diff panel (only when there are differences)
     if ratio < 1.0 and (body_lines_a or body_lines_b):
@@ -511,7 +599,9 @@ def pair_card(outcome: FilePairOutcome,
             f'    <span class="dl-ins">+ added</span>'
             f'  </span>'
             f'</div>'
-            + build_diff_html(body_lines_a, body_lines_b) +
+            + build_diff_html(body_lines_a, body_lines_b,
+                              line_nums_a=outcome.body_line_numbers_a or None,
+                              line_nums_b=outcome.body_line_numbers_b or None) +
             f'</div>'
         )
         diff_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{diff_id}\')">▶ diff</span>'
@@ -714,6 +804,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .sec-table tr.s-added td:first-child{border-left:3px solid var(--s-added)}
 .sec-table tr.s-removed td:first-child{border-left:3px solid var(--s-removed)}
 .title-changed{font-size:11px;color:var(--moderate);margin-left:6px}
+.pg-lnr{font-size:10px;color:var(--muted);font-family:'Cascadia Code','Consolas',monospace}
 
 /* Badges */
 .badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.5px;
@@ -730,7 +821,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .no-results{text-align:center;color:var(--muted);padding:40px;font-size:14px}
 
 /* Diff panel */
-.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;max-height:600px;overflow-y:auto}
+.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto}
 .diff-wrap.open{display:block}
 .diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
 .diff-toolbar{display:flex;justify-content:space-between;align-items:center;
@@ -764,6 +855,27 @@ mark.wi{background:#bbf7d0;color:#14532d;border-radius:2px;padding:0 1px}
 
 /* Toggle button variants */
 .card-toggle.no-diff{color:var(--identical);cursor:default}
+
+/* Page-level filter bar (inside each card's pages panel) */
+.pg-filter-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.pf-btn{display:inline-flex;align-items:center;gap:5px;border:1px solid var(--border);
+        background:#fff;border-radius:20px;padding:3px 10px;font-size:11px;font-weight:600;
+        cursor:pointer;transition:all .15s;white-space:nowrap;line-height:1.6}
+.pf-btn:hover{border-color:#9ca3af}
+.pf-dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.pf-dot.s-identical{background:var(--identical)}
+.pf-dot.s-minor{background:var(--minor)}
+.pf-dot.s-moderate{background:var(--moderate)}
+.pf-dot.s-significant{background:var(--significant)}
+.pf-dot.s-added{background:var(--s-added)}
+.pf-dot.s-removed{background:var(--s-removed)}
+.pf-btn.pf-all.active{background:var(--text);color:#fff;border-color:var(--text)}
+.pf-btn.pf-s-identical.active{background:var(--identical-bg);color:var(--identical);border-color:var(--identical)}
+.pf-btn.pf-s-minor.active{background:var(--minor-bg);color:var(--minor);border-color:var(--minor)}
+.pf-btn.pf-s-moderate.active{background:var(--moderate-bg);color:var(--moderate);border-color:var(--moderate)}
+.pf-btn.pf-s-significant.active{background:var(--significant-bg);color:var(--significant);border-color:var(--significant)}
+.pf-btn.pf-s-added.active{background:#dbeafe;color:var(--s-added);border-color:var(--s-added)}
+.pf-btn.pf-s-removed.active{background:#f3f4f6;color:#374151;border-color:#9ca3af}
 """
 
 JS = """
@@ -794,6 +906,17 @@ function setFilter(verdict){
       c.style.display=(c.dataset.verdict===verdict)?'':'none';
     });
   }
+}
+function setPageFilter(panelId,css){
+  const panel=document.getElementById(panelId);
+  panel.querySelectorAll('.pf-btn').forEach(b=>b.classList.remove('active'));
+  panel.querySelector('.pf-'+(css==='all'?'all':css)).classList.add('active');
+  panel.querySelectorAll('tbody tr:not(.diff-row)').forEach(row=>{
+    const show=css==='all'||row.classList.contains(css);
+    row.style.display=show?'':'none';
+    const next=row.nextElementSibling;
+    if(next&&next.classList.contains('diff-row'))next.style.display=show?'':'none';
+  });
 }
 document.addEventListener('DOMContentLoaded',()=>{
   document.querySelector('.f-all').classList.add('active');
