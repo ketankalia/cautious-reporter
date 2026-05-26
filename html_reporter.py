@@ -911,7 +911,7 @@ function setPageFilter(panelId,css){
   const panel=document.getElementById(panelId);
   panel.querySelectorAll('.pf-btn').forEach(b=>b.classList.remove('active'));
   panel.querySelector('.pf-'+(css==='all'?'all':css)).classList.add('active');
-  panel.querySelectorAll('tbody tr:not(.diff-row)').forEach(row=>{
+  panel.querySelectorAll('table.sec-table > tbody > tr:not(.diff-row)').forEach(row=>{
     const show=css==='all'||row.classList.contains(css);
     row.style.display=show?'':'none';
     const next=row.nextElementSibling;
