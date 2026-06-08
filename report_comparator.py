@@ -271,7 +271,8 @@ def extract_sections(body_lines: List[str], body_line_numbers: List[int] = None)
 # 4.  REPORT PARSER
 # ---------------------------------------------------------------------------
 
-def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
+def parse_report(filename: str, ignore_dates: bool = False,
+                 ignore_line_patterns: Optional[List[str]] = None) -> ParsedReport:
     """Top-level parser: read file → pages → header/footer → sections."""
     try:
         with open(filename, "r", encoding="utf-8", errors="replace") as f:
@@ -301,6 +302,8 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
                 return j + 1
         return _scan_pos  # fallback: shouldn't normally be reached
 
+    _cpats = [re.compile(p) for p in ignore_line_patterns] if ignore_line_patterns else []
+
     all_body_lines: List[str] = []
     all_body_line_nums: List[int] = []
 
@@ -308,6 +311,10 @@ def parse_report(filename: str, ignore_dates: bool = False) -> ParsedReport:
         h, body, f = strip_header_footer(raw_lines, global_headers, global_footers)
         # Compute positions against the pre-mask body so they match the raw file
         page_nums = [_raw_line_num(ln) for ln in body]
+        if _cpats:
+            keep = [not any(c.search(l) for c in _cpats) for l in body]
+            body = [l for l, k in zip(body, keep) if k]
+            page_nums = [n for n, k in zip(page_nums, keep) if k]
         if ignore_dates:
             body = filter_lines(body)
         page = Page(number=i + 1,
@@ -537,11 +544,14 @@ def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
     total   = max(len(lines_a), len(lines_b), 1)
     denom   = len(lines_a) + len(lines_b)
     ratio   = (2 * common / denom) if denom else 1.0
+    sim     = round(ratio, 4)
+    if added + deleted > 0:
+        sim = min(sim, 0.9999)
     return {
         "lines_added":      added,
         "lines_deleted":    deleted,
         "lines_common":     common,
-        "similarity_ratio": round(ratio, 4),
+        "similarity_ratio": sim,
         "change_pct":       round((added + deleted) / total * 100, 2),
     }
 
@@ -1175,11 +1185,12 @@ def compare_folder_pair(path_a: Path,
                         match_type: str,
                         fuzzy_ratio: float,
                         use_semantic: bool,
-                        ignore_dates: bool = False) -> FilePairOutcome:
+                        ignore_dates: bool = False,
+                        ignore_line_patterns: Optional[List[str]] = None) -> FilePairOutcome:
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
-        ra = parse_report(str(path_a), ignore_dates=ignore_dates)
-        rb = parse_report(str(path_b), ignore_dates=ignore_dates)
+        ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
+        rb = parse_report(str(path_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
 
         def _filter(lines: List[str], nums: List[int]):
             pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
@@ -1212,7 +1223,8 @@ def run_folder_comparison(folder_a: Path,
                            use_semantic: bool = False,
                            output_dir: Optional[Path] = None,
                            include_diff: bool = True,
-                           ignore_dates: bool = False) -> None:
+                           ignore_dates: bool = False,
+                           ignore_line_patterns: Optional[List[str]] = None) -> None:
     """
     Top-level folder comparison.  Scans both folders, matches files,
     runs per-file comparisons, writes individual reports, and writes
@@ -1242,16 +1254,16 @@ def run_folder_comparison(folder_a: Path,
 
     for pa, pb in match.exact_pairs:
         print(f"  Comparing [exact ] {pa.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates)
+        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates, ignore_line_patterns)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns)
 
     for pa, pb, ratio in match.fuzzy_pairs:
         print(f"  Comparing [fuzzy ] {pa.name} ↔ {pb.name}  (name similarity {ratio:.0%})",
               file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates)
+        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates, ignore_line_patterns)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns)
 
     # ---- Master summary ----
     summary_text = _format_folder_summary(
@@ -1269,7 +1281,8 @@ def run_folder_comparison(folder_a: Path,
 def _write_pair_report(outcome: FilePairOutcome,
                        output_dir: Optional[Path],
                        include_diff: bool,
-                       ignore_dates: bool = False) -> None:
+                       ignore_dates: bool = False,
+                       ignore_line_patterns: Optional[List[str]] = None) -> None:
     """Write a single pair's comparison report to output_dir (or stdout)."""
     if outcome.error:
         text = (f"ERROR comparing {outcome.file_a.name} ↔ {outcome.file_b.name}\n"
@@ -1278,8 +1291,8 @@ def _write_pair_report(outcome: FilePairOutcome,
         ra = ParsedReport(filename=str(outcome.file_a))
         rb = ParsedReport(filename=str(outcome.file_b))
         # Re-parse to get full objects for the formatter
-        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates)
-        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates)
+        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
+        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
         text = format_report(outcome.result, ra, rb, include_diff=include_diff)
 
     if output_dir:
@@ -1453,6 +1466,8 @@ def main():
                         help="Skip unified diff output (recommended for large files)")
     parser.add_argument("--ignore-dates", action="store_true",
                         help="Remove date/time patterns from comparison (ISO, US, timestamps, etc.)")
+    parser.add_argument("--ignore-lines", action="append", default=[], metavar="PATTERN",
+                        help="Skip lines matching this regex (can be repeated: --ignore-lines PAT1 --ignore-lines PAT2)")
 
     # ---- single-file options ----
     parser.add_argument("--output", "-o",
@@ -1487,14 +1502,15 @@ def main():
             output_dir=output_dir,
             include_diff=not args.no_diff,
             ignore_dates=args.ignore_dates,
+            ignore_line_patterns=args.ignore_lines or None,
         )
 
     # ------------------------------------------------------------------ FILE
     elif path_a.is_file() and path_b.is_file():
         print(f"Parsing  : {path_a}", file=sys.stderr)
-        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates)
+        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None)
         print(f"Parsing  : {path_b}", file=sys.stderr)
-        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates)
+        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None)
 
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
