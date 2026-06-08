@@ -26,7 +26,10 @@ Usage:
 """
 
 import argparse
+import base64
 import difflib
+import gzip
+import json as _json
 import re
 import sys
 from html import escape
@@ -220,78 +223,103 @@ def word_diff_inline(old: str, new: str) -> Tuple[str, str]:
     return ''.join(old_parts), ''.join(new_parts)
 
 
-def build_diff_html(lines_a: List[str], lines_b: List[str],
-                    context: int = 3,
-                    line_nums_a: Optional[List[int]] = None,
-                    line_nums_b: Optional[List[int]] = None) -> str:
+def _diff_rows(lines_a: List[str], lines_b: List[str],
+               context: int = 3,
+               line_nums_a: Optional[List[int]] = None,
+               line_nums_b: Optional[List[int]] = None) -> list:
     """
-    Build a unified-style HTML diff table.
+    Compute diff opcodes and return a compact, JSON-serialisable row list.
 
-    Layout: two narrow line-number columns (A | B) then the content column.
-    Equal lines are shown collapsed when there are more than 2×context of them.
-    For replace operations where both sides have equal line counts, word-level
-    highlights are applied via word_diff_inline().
-    Uses the pandas LCS engine (diff_opcodes) — no line-count cap.
-    line_nums_a / line_nums_b: raw file line numbers for each element of lines_a / lines_b;
-    when provided, those numbers are shown; otherwise 1-based sequential.
+    Each row is one of:
+      [0, lna, lnb, escaped_html]  — context line
+      [1, lna, html]               — deleted line  (html may contain <mark> from word diff)
+      [2, lnb, html]               — inserted line
+      [3, count]                   — collapsed skip marker
     """
     opcodes = diff_opcodes(lines_a, lines_b)
-    rows: List[str] = []
+    rows: list = []
 
     def lna(i: int) -> int: return line_nums_a[i] if line_nums_a else i + 1
     def lnb(j: int) -> int: return line_nums_b[j] if line_nums_b else j + 1
-
-    def ctx(line: str, i: int, j: int) -> str:
-        return (f'<tr class="dc"><td class="ln">{lna(i)}</td><td class="ln">{lnb(j)}</td>'
-                f'<td class="dx"> {escape(line)}</td></tr>')
-
-    def deleted(html_line: str, i: int) -> str:
-        return (f'<tr class="dd"><td class="ln">{lna(i)}</td><td class="ln"></td>'
-                f'<td class="dx">−&nbsp;{html_line}</td></tr>')
-
-    def inserted(html_line: str, j: int) -> str:
-        return (f'<tr class="di"><td class="ln"></td><td class="ln">{lnb(j)}</td>'
-                f'<td class="dx">+&nbsp;{html_line}</td></tr>')
-
-    def skipped(n: int) -> str:
-        return (f'<tr class="ds"><td colspan="3">'
-                f'⋯ {n} unchanged line{"s" if n != 1 else ""} ⋯</td></tr>')
 
     for tag, i1, i2, j1, j2 in opcodes:
         if tag == 'equal':
             n = i2 - i1
             if n <= 2 * context:
                 for k in range(n):
-                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
+                    rows.append([0, lna(i1+k), lnb(j1+k), escape(lines_a[i1+k])])
             else:
                 for k in range(context):
-                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
-                rows.append(skipped(n - 2 * context))
+                    rows.append([0, lna(i1+k), lnb(j1+k), escape(lines_a[i1+k])])
+                rows.append([3, n - 2 * context])
                 for k in range(n - context, n):
-                    rows.append(ctx(lines_a[i1 + k], i1 + k, j1 + k))
-
+                    rows.append([0, lna(i1+k), lnb(j1+k), escape(lines_a[i1+k])])
         elif tag == 'insert':
             for k in range(j2 - j1):
-                rows.append(inserted(escape(lines_b[j1 + k]), j1 + k))
-
+                rows.append([2, lnb(j1+k), escape(lines_b[j1+k])])
         elif tag == 'delete':
             for k in range(i2 - i1):
-                rows.append(deleted(escape(lines_a[i1 + k]), i1 + k))
-
+                rows.append([1, lna(i1+k), escape(lines_a[i1+k])])
         elif tag == 'replace':
             del_lines = lines_a[i1:i2]
             ins_lines = lines_b[j1:j2]
             if len(del_lines) == len(ins_lines):
                 for k, (old, new) in enumerate(zip(del_lines, ins_lines)):
                     old_html, new_html = word_diff_inline(old, new)
-                    rows.append(deleted(old_html, i1 + k))
-                    rows.append(inserted(new_html, j1 + k))
+                    rows.append([1, lna(i1+k), old_html])
+                    rows.append([2, lnb(j1+k), new_html])
             else:
                 for k, line in enumerate(del_lines):
-                    rows.append(deleted(escape(line), i1 + k))
+                    rows.append([1, lna(i1+k), escape(line)])
                 for k, line in enumerate(ins_lines):
-                    rows.append(inserted(escape(line), j1 + k))
+                    rows.append([2, lnb(j1+k), escape(line)])
+    return rows
 
+
+def _diff_tag(diff_id: str, rows: list) -> str:
+    """Serialise rows to gzip-compressed base64 JSON inside a <script> data tag."""
+    raw = _json.dumps(rows, separators=(',', ':'), ensure_ascii=False)
+    try:
+        b64 = base64.b64encode(
+            gzip.compress(raw.encode('utf-8'), compresslevel=9)
+        ).decode('ascii')
+        return (f'<script type="application/json" id="{diff_id}-data" data-enc="gz">'
+                f'{b64}</script>')
+    except Exception:
+        return (f'<script type="application/json" id="{diff_id}-data">'
+                f'{raw}</script>')
+
+
+def build_diff_html(lines_a: List[str], lines_b: List[str],
+                    context: int = 3,
+                    line_nums_a: Optional[List[int]] = None,
+                    line_nums_b: Optional[List[int]] = None) -> str:
+    """
+    Build a unified-style HTML diff table (eager rendering).
+
+    Uses _diff_rows() internally; kept for non-browser / test callers.
+    The HTML reporter uses _diff_rows() + _diff_tag() for deferred rendering.
+    """
+    html_rows: List[str] = []
+    for row in _diff_rows(lines_a, lines_b, context, line_nums_a, line_nums_b):
+        t = row[0]
+        if t == 0:
+            html_rows.append(
+                f'<tr class="dc"><td class="ln">{row[1]}</td><td class="ln">{row[2]}</td>'
+                f'<td class="dx"> {row[3]}</td></tr>')
+        elif t == 1:
+            html_rows.append(
+                f'<tr class="dd"><td class="ln">{row[1]}</td><td class="ln"></td>'
+                f'<td class="dx">−&nbsp;{row[2]}</td></tr>')
+        elif t == 2:
+            html_rows.append(
+                f'<tr class="di"><td class="ln"></td><td class="ln">{row[1]}</td>'
+                f'<td class="dx">+&nbsp;{row[2]}</td></tr>')
+        else:
+            n = row[1]
+            html_rows.append(
+                f'<tr class="ds"><td colspan="3">'
+                f'⋯ {n} unchanged line{"s" if n != 1 else ""} ⋯</td></tr>')
     return (
         '<table class="diff-table">'
         '<colgroup>'
@@ -300,7 +328,7 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
         '<thead><tr>'
         '<th class="ln">A</th><th class="ln">B</th><th>Content</th>'
         '</tr></thead>'
-        '<tbody>' + ''.join(rows) + '</tbody>'
+        '<tbody>' + ''.join(html_rows) + '</tbody>'
         '</table>'
     )
 
@@ -404,6 +432,7 @@ def pages_panel(page_comparisons: List[dict],
     filter_bar = f'<div class="pg-filter-bar">{filter_btns}</div>'
 
     rows: List[str] = []
+    script_tags: List[str] = []
     matched_idx = 0
 
     for pc in page_comparisons:
@@ -438,10 +467,13 @@ def pages_panel(page_comparisons: List[dict],
                     f'<span class="card-toggle" onclick="toggle(this,\'{diff_pid}\')">'
                     f'▶ diff</span>'
                 )
+                script_tags.append(
+                    _diff_tag(diff_pid, _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums))
+                )
                 diff_row = (
                     f'<tr class="diff-row" id="{diff_pid}">'
                     f'<td colspan="5">'
-                    f'<div class="diff-wrap open">'
+                    f'<div class="diff-wrap open" data-diff-src="{diff_pid}-data">'
                     f'<div class="diff-toolbar">'
                     f'  <span>Page {pc["page_num_a"]} — inline diff</span>'
                     f'  <span class="diff-legend">'
@@ -450,8 +482,7 @@ def pages_panel(page_comparisons: List[dict],
                     f'    <span class="dl-ins">+ added</span>'
                     f'  </span>'
                     f'</div>'
-                    + build_diff_html(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums)
-                    + '</div></td></tr>'
+                    f'</div></td></tr>'
                 )
             else:
                 diff_cell = '<span class="card-toggle no-diff">✓</span>'
@@ -502,6 +533,7 @@ def pages_panel(page_comparisons: List[dict],
         f'<div class="sec-detail" id="{panel_id}">'
         + filter_bar
         + table
+        + ''.join(script_tags)
         + '</div>'
     )
     toggle = (
@@ -589,8 +621,11 @@ def pair_card(outcome: FilePairOutcome,
 
     # Build the diff panel (only when there are differences)
     if ratio < 1.0 and (body_lines_a or body_lines_b):
+        _rows = _diff_rows(body_lines_a, body_lines_b,
+                           line_nums_a=outcome.body_line_numbers_a or None,
+                           line_nums_b=outcome.body_line_numbers_b or None)
         diff_panel = (
-            f'<div class="diff-wrap" id="{diff_id}">'
+            f'<div class="diff-wrap" id="{diff_id}" data-diff-src="{diff_id}-data">'
             f'<div class="diff-toolbar">'
             f'  <span>Inline diff — body content (headers &amp; footers excluded)</span>'
             f'  <span class="diff-legend">'
@@ -599,10 +634,8 @@ def pair_card(outcome: FilePairOutcome,
             f'    <span class="dl-ins">+ added</span>'
             f'  </span>'
             f'</div>'
-            + build_diff_html(body_lines_a, body_lines_b,
-                              line_nums_a=outcome.body_line_numbers_a or None,
-                              line_nums_b=outcome.body_line_numbers_b or None) +
             f'</div>'
+            + _diff_tag(diff_id, _rows)
         )
         diff_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{diff_id}\')">▶ diff</span>'
     else:
@@ -879,9 +912,61 @@ mark.wi{background:#bbf7d0;color:#14532d;border-radius:2px;padding:0 1px}
 """
 
 JS = """
-function toggle(btn,id){
+async function renderDiff(el){
+  if(el.dataset.rendered)return;
+  const script=document.getElementById(el.dataset.diffSrc);
+  if(!script)return;
+  let json;
+  try{
+    if(script.dataset.enc==='gz'){
+      const bin=atob(script.textContent.trim());
+      const bytes=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+      const ds=new DecompressionStream('gzip');
+      const w=ds.writable.getWriter();
+      w.write(bytes);w.close();
+      json=new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+    }else{
+      json=script.textContent;
+    }
+    const rows=JSON.parse(json);
+    const tbody=document.createElement('tbody');
+    for(const row of rows){
+      const tr=document.createElement('tr');
+      const[t,a,b,c]=row;
+      if(t===0){
+        tr.className='dc';
+        tr.innerHTML='<td class="ln">'+a+'</td><td class="ln">'+b+'</td><td class="dx"> '+c+'</td>';
+      }else if(t===1){
+        tr.className='dd';
+        tr.innerHTML='<td class="ln">'+a+'</td><td class="ln"></td><td class="dx">− '+b+'</td>';
+      }else if(t===2){
+        tr.className='di';
+        tr.innerHTML='<td class="ln"></td><td class="ln">'+a+'</td><td class="dx">+ '+b+'</td>';
+      }else{
+        tr.className='ds';
+        tr.innerHTML='<td colspan="3">⋯ '+a+' unchanged line'+(a!==1?'s':'')+' ⋯</td>';
+      }
+      tbody.appendChild(tr);
+    }
+    const tbl=document.createElement('table');
+    tbl.className='diff-table';
+    tbl.innerHTML='<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>'
+      +'<thead><tr><th class="ln">A</th><th class="ln">B</th><th>Content</th></tr></thead>';
+    tbl.appendChild(tbody);
+    el.appendChild(tbl);
+  }catch(e){
+    el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
+  }
+  el.dataset.rendered='1';
+}
+async function toggle(btn,id){
   const el=document.getElementById(id);
   const wasOpen=el.classList.contains('open');
+  if(!wasOpen){
+    const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
+    if(target&&!target.dataset.rendered)await renderDiff(target);
+  }
   el.classList.toggle('open');
   btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶',wasOpen?'▶':'▼');
 }
@@ -1042,7 +1127,8 @@ def run(folder_a: Path, folder_b: Path,
         linux_base: Optional[str],
         windows_base: Optional[str],
         bcompare_exe: str,
-        ignore_dates: bool = False) -> None:
+        ignore_dates: bool = False,
+        ignore_line_patterns: Optional[List[str]] = None) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1068,7 +1154,7 @@ def run(folder_a: Path, folder_b: Path,
 
     for i, (pa, pb, mtype, mratio) in enumerate(all_pairs):
         print(f"  Comparing [{mtype:5}] {pa.name} ↔ {pb.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates)
+        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns)
         outcomes.append(outcome)
 
         win_a, url_a = resolve_paths(pa, linux_base, windows_base)
@@ -1122,6 +1208,8 @@ def main():
                    help="Enable TF-IDF semantic similarity (requires scikit-learn)")
     p.add_argument("--ignore-dates", action="store_true",
                    help="Remove date/time patterns from comparison (ISO, US, timestamps, etc.)")
+    p.add_argument("--ignore-lines", action="append", default=[], metavar="PATTERN",
+                   help="Skip lines matching this regex (can be repeated: --ignore-lines PAT1 --ignore-lines PAT2)")
     p.add_argument("--linux-base",
                    help="Linux absolute path of the outputs root (for path remapping)")
     p.add_argument("--windows-base",
@@ -1143,7 +1231,8 @@ def main():
         linux_base     = args.linux_base,
         windows_base   = args.windows_base,
         bcompare_exe   = args.bcompare,
-        ignore_dates   = args.ignore_dates,
+        ignore_dates          = args.ignore_dates,
+        ignore_line_patterns  = args.ignore_lines or None,
     )
 
 
