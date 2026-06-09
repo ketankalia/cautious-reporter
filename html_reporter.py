@@ -290,6 +290,13 @@ def _diff_tag(diff_id: str, rows: list) -> str:
                 f'{raw}</script>')
 
 
+def _pages_tag(panel_id: str, data: dict) -> str:
+    """Serialise page comparison metadata as a plain JSON <script> data tag."""
+    raw = _json.dumps(data, separators=(',', ':'))
+    return (f'<script type="application/json" id="{panel_id}-pages-data">'
+            f'{raw}</script>')
+
+
 def build_diff_html(lines_a: List[str], lines_b: List[str],
                     context: int = 3,
                     line_nums_a: Optional[List[int]] = None,
@@ -389,13 +396,12 @@ def pages_panel(page_comparisons: List[dict],
                 per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None) -> Tuple[str, str]:
     """Return (toggle_html, panel_html) for per-page comparison.
     Returns ('', '') when there is nothing to show (single-page files).
-    per_page_line_numbers: raw file line numbers parallel to per_page_lines; when provided,
-    passed to build_diff_html so numbers match actual file positions.
+    Table content is deferred: stored as JSON in a <script> tag, built by
+    renderPages() in JS on first toggle — keeps zero <tr> nodes in the DOM at load.
     """
     if not page_comparisons:
         return '', ''
 
-    # Pre-count statuses for the filter bar
     status_counts: dict = {}
     for pc in page_comparisons:
         if pc["status"] == "matched":
@@ -409,53 +415,25 @@ def pages_panel(page_comparisons: List[dict],
             k = "s-removed"
         status_counts[k] = status_counts.get(k, 0) + 1
 
-    _STATUS_META = [
-        ("s-identical",   "Identical"),
-        ("s-minor",       "Minor"),
-        ("s-moderate",    "Moderate"),
-        ("s-significant", "Changed"),
-        ("s-added",       "Added"),
-        ("s-removed",     "Removed"),
-    ]
-    total_pages = sum(status_counts.values())
-    filter_btns = (
-        f'<button class="pf-btn pf-all active" onclick="setPageFilter(\'{panel_id}\',\'all\')">'
-        f'All&nbsp;({total_pages})</button>'
-    )
-    for css_key, label in _STATUS_META:
-        cnt = status_counts.get(css_key, 0)
-        if cnt:
-            filter_btns += (
-                f'<button class="pf-btn pf-{css_key}" onclick="setPageFilter(\'{panel_id}\',\'{css_key}\')">'
-                f'<span class="pf-dot {css_key}"></span>{label}&nbsp;({cnt})</button>'
-            )
-    filter_bar = f'<div class="pg-filter-bar">{filter_btns}</div>'
-
-    rows: List[str] = []
+    pages: list = []
     script_tags: List[str] = []
     matched_idx = 0
 
     for pc in page_comparisons:
         if pc["status"] == "matched":
-            r = pc["diff"]["similarity_ratio"]
-            css = ("s-identical" if r == 1.00 else
-                   "s-minor"     if r >= 0.85 else
-                   "s-moderate"  if r >= 0.60 else "s-significant")
-            badge = ("IDENTICAL" if r == 1.00 else
-                     "MINOR"     if r >= 0.85 else
-                     "MODERATE"  if r >= 0.60 else "CHANGED")
-            sim = f"{r * 100:.1f}%"
-            chg = f'+{pc["diff"]["lines_added"]} −{pc["diff"]["lines_deleted"]}'
+            r    = pc["diff"]["similarity_ratio"]
+            add  = pc["diff"]["lines_added"]
+            ndel = pc["diff"]["lines_deleted"]
 
             if per_page_line_numbers and matched_idx < len(per_page_line_numbers):
                 _rng_a, _rng_b = per_page_line_numbers[matched_idx]
                 _ra = f'L{_rng_a[0]}–{_rng_a[-1]}' if _rng_a else ''
                 _rb = f'L{_rng_b[0]}–{_rng_b[-1]}' if _rng_b else ''
-                _lnr = f' / '.join(x for x in [_ra, _rb] if x)
-                ln_hint = f'<br><span class="pg-lnr">{_lnr}</span>' if _lnr else ''
+                lnr = ' / '.join(x for x in [_ra, _rb] if x)
             else:
-                ln_hint = ''
+                lnr = ''
 
+            diff_id = None
             if r < 1.0 and matched_idx < len(per_page_lines):
                 diff_pid = f"{panel_id}-pd{matched_idx}"
                 la, lb = per_page_lines[matched_idx]
@@ -463,77 +441,27 @@ def pages_panel(page_comparisons: List[dict],
                     la_nums, lb_nums = per_page_line_numbers[matched_idx]
                 else:
                     la_nums, lb_nums = None, None
-                diff_cell = (
-                    f'<span class="card-toggle" onclick="toggle(this,\'{diff_pid}\')">'
-                    f'▶ diff</span>'
-                )
                 script_tags.append(
                     _diff_tag(diff_pid, _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums))
                 )
-                diff_row = (
-                    f'<tr class="diff-row" id="{diff_pid}">'
-                    f'<td colspan="5">'
-                    f'<div class="diff-wrap open" data-diff-src="{diff_pid}-data">'
-                    f'<div class="diff-toolbar">'
-                    f'  <span>Page {pc["page_num_a"]} — inline diff</span>'
-                    f'  <span class="diff-legend">'
-                    f'    <span class="dl-del">− removed</span>'
-                    f'    <span class="dl-chg">~ changed word</span>'
-                    f'    <span class="dl-ins">+ added</span>'
-                    f'  </span>'
-                    f'</div>'
-                    f'</div></td></tr>'
-                )
-            else:
-                diff_cell = '<span class="card-toggle no-diff">✓</span>'
-                diff_row = ''
+                diff_id = diff_pid
 
+            # [0, page_num_a, page_num_b, ratio, lines_added, lines_deleted, lnr, diff_id_or_null]
+            pages.append([0, pc["page_num_a"], pc["page_num_b"], r, add, ndel, lnr, diff_id])
             matched_idx += 1
-            rows.append(
-                f'<tr class="{css}">'
-                f'<td>Page {pc["page_num_a"]}{ln_hint}</td>'
-                f'<td><span class="badge {css}">{badge}</span></td>'
-                f'<td class="num">{sim}</td>'
-                f'<td class="num mono">{chg}</td>'
-                f'<td class="num">{diff_cell}</td>'
-                f'</tr>'
-                + diff_row
-            )
         elif pc["status"] == "added":
-            rows.append(
-                f'<tr class="s-added">'
-                f'<td>Page {pc["page_num_b"]}</td>'
-                f'<td><span class="badge s-added">ADDED</span></td>'
-                f'<td class="num">—</td>'
-                f'<td class="num mono">{pc["lines"]} lines</td>'
-                f'<td></td>'
-                f'</tr>'
-            )
+            # [1, page_num_b, lines]
+            pages.append([1, pc["page_num_b"], pc["lines"]])
         else:
-            rows.append(
-                f'<tr class="s-removed">'
-                f'<td>Page {pc["page_num_a"]}</td>'
-                f'<td><span class="badge s-removed">REMOVED</span></td>'
-                f'<td class="num">—</td>'
-                f'<td class="num mono">{pc["lines"]} lines</td>'
-                f'<td></td>'
-                f'</tr>'
-            )
+            # [2, page_num_a, lines]
+            pages.append([2, pc["page_num_a"], pc["lines"]])
 
-    table = (
-        '<table class="sec-table">'
-        '<thead><tr>'
-        '<th>Page</th><th>Status</th>'
-        '<th class="num">Similarity</th><th class="num">Changes</th><th></th>'
-        '</tr></thead>'
-        '<tbody>' + ''.join(rows) + '</tbody>'
-        '</table>'
-    )
+    data = {"counts": status_counts, "pages": pages}
+
     panel = (
-        f'<div class="sec-detail" id="{panel_id}">'
-        + filter_bar
-        + table
+        f'<div class="sec-detail" id="{panel_id}" data-pages-src="{panel_id}-pages-data">'
         + ''.join(script_tags)
+        + _pages_tag(panel_id, data)
         + '</div>'
     )
     toggle = (
@@ -854,7 +782,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .no-results{text-align:center;color:var(--muted);padding:40px;font-size:14px}
 
 /* Diff panel */
-.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto}
+.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;overflow-y:auto;max-height:600px}
 .diff-wrap.open{display:block}
 .diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
 .diff-toolbar{display:flex;justify-content:space-between;align-items:center;
@@ -870,7 +798,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .diff-table .ln{width:44px;text-align:right;color:#9ca3af;background:#f8fafc;
                 border-right:1px solid var(--border);padding:1px 6px;
                 font-size:11px;user-select:none;white-space:nowrap}
-.diff-table .dx{padding:1px 12px;white-space:pre-wrap;word-break:break-all}
+.diff-table .dx{padding:1px 12px;white-space:pre}
 
 /* Row colours */
 .dc .dx{background:#fff;color:var(--text)}
@@ -912,6 +840,35 @@ mark.wi{background:#bbf7d0;color:#14532d;border-radius:2px;padding:0 1px}
 """
 
 JS = """
+const ROW_H=22,V_BUF=50;
+function makeSpacerRow(){
+  const tr=document.createElement('tr');
+  const td=document.createElement('td');
+  td.colSpan=3;td.style.cssText='padding:0;border:0;font-size:0;line-height:0';
+  tr.appendChild(td);
+  return{tr,td};
+}
+function buildDiffRow(row){
+  const tr=document.createElement('tr');
+  const[t,a,b,c]=row;
+  if(t===0){tr.className='dc';tr.innerHTML='<td class="ln">'+a+'</td><td class="ln">'+b+'</td><td class="dx"> '+c+'</td>';}
+  else if(t===1){tr.className='dd';tr.innerHTML='<td class="ln">'+a+'</td><td class="ln"></td><td class="dx">− '+b+'</td>';}
+  else if(t===2){tr.className='di';tr.innerHTML='<td class="ln"></td><td class="ln">'+a+'</td><td class="dx">+ '+b+'</td>';}
+  else{tr.className='ds';tr.innerHTML='<td colspan="3">⋯ '+a+' unchanged line'+(a!==1?'s':'')+' ⋯</td>';}
+  return tr;
+}
+function applyDiffWindow(state,scrollTop){
+  const{rows,tbody,top,bot,el}=state;
+  const visH=el.clientHeight||600;
+  const first=Math.max(0,Math.floor(scrollTop/ROW_H)-V_BUF);
+  const last=Math.min(rows.length,first+Math.ceil(visH/ROW_H)+V_BUF*2);
+  top.td.style.height=(first*ROW_H)+'px';
+  bot.td.style.height=Math.max(0,(rows.length-last)*ROW_H)+'px';
+  tbody.replaceChildren();
+  tbody.appendChild(top.tr);
+  for(let i=first;i<last;i++)tbody.appendChild(buildDiffRow(rows[i]));
+  tbody.appendChild(bot.tr);
+}
 async function renderDiff(el){
   if(el.dataset.rendered)return;
   const script=document.getElementById(el.dataset.diffSrc);
@@ -931,39 +888,59 @@ async function renderDiff(el){
     }
     const rows=JSON.parse(json);
     const tbody=document.createElement('tbody');
-    for(const row of rows){
-      const tr=document.createElement('tr');
-      const[t,a,b,c]=row;
-      if(t===0){
-        tr.className='dc';
-        tr.innerHTML='<td class="ln">'+a+'</td><td class="ln">'+b+'</td><td class="dx"> '+c+'</td>';
-      }else if(t===1){
-        tr.className='dd';
-        tr.innerHTML='<td class="ln">'+a+'</td><td class="ln"></td><td class="dx">− '+b+'</td>';
-      }else if(t===2){
-        tr.className='di';
-        tr.innerHTML='<td class="ln"></td><td class="ln">'+a+'</td><td class="dx">+ '+b+'</td>';
-      }else{
-        tr.className='ds';
-        tr.innerHTML='<td colspan="3">⋯ '+a+' unchanged line'+(a!==1?'s':'')+' ⋯</td>';
-      }
-      tbody.appendChild(tr);
-    }
+    const top=makeSpacerRow(),bot=makeSpacerRow();
+    const state={rows,tbody,top,bot,el};
+    applyDiffWindow(state,0);
     const tbl=document.createElement('table');
     tbl.className='diff-table';
     tbl.innerHTML='<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>'
       +'<thead><tr><th class="ln">A</th><th class="ln">B</th><th>Content</th></tr></thead>';
     tbl.appendChild(tbody);
     el.appendChild(tbl);
+    el.addEventListener('scroll',()=>applyDiffWindow(state,el.scrollTop));
   }catch(e){
     el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
   }
+  el.dataset.rendered='1';
+}
+function renderPages(el){
+  if(el.dataset.rendered)return;
+  const script=document.getElementById(el.dataset.pagesSrc);
+  if(!script)return;
+  const d=JSON.parse(script.textContent);
+  const SM=[['s-identical','Identical'],['s-minor','Minor'],['s-moderate','Moderate'],['s-significant','Changed'],['s-added','Added'],['s-removed','Removed']];
+  const pid=el.id;
+  const total=Object.values(d.counts).reduce((a,b)=>a+b,0);
+  let fb=`<button class="pf-btn pf-all active" onclick="setPageFilter('${pid}','all')">All (${total})</button>`;
+  for(const[css,lbl]of SM){const cnt=d.counts[css]||0;if(cnt)fb+=`<button class="pf-btn pf-${css}" onclick="setPageFilter('${pid}','${css}')"><span class="pf-dot ${css}"></span>${lbl} (${cnt})</button>`;}
+  let tb='';
+  for(const pg of d.pages){
+    if(pg[0]===0){
+      const[,pna,pnb,ratio,add,ndel,lnr,did]=pg;
+      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+      const sim=(ratio*100).toFixed(1)+'%';
+      const chg=`+${add} −${ndel}`;
+      const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
+      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">&#9658; diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+      tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td></tr>`;
+      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
+    }else if(pg[0]===1){
+      const[,pnb,lines]=pg;
+      tb+=`<tr class="s-added"><td>Page ${pnb}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
+    }else{
+      const[,pna,lines]=pg;
+      tb+=`<tr class="s-removed"><td>Page ${pna}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
+    }
+  }
+  el.insertAdjacentHTML('afterbegin',`<div class="pg-filter-bar">${fb}</div><table class="sec-table"><thead><tr><th>Page</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`);
   el.dataset.rendered='1';
 }
 async function toggle(btn,id){
   const el=document.getElementById(id);
   const wasOpen=el.classList.contains('open');
   if(!wasOpen){
+    if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
     const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
     if(target&&!target.dataset.rendered)await renderDiff(target);
   }
