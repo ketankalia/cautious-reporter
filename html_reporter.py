@@ -5,6 +5,9 @@ Generates a self-contained HTML comparison report from two folders of text
 reports, using the comparison engine in report_comparator.py.
 
 Usage:
+
+# python report_comparator.py folder_a/ folder_b/ --split-config splits.csv
+# python html_reporter.py folder_a/ folder_b/ --output report.html --split-config splits.csv
     # Basic (paths resolved from wherever the script runs)
     python html_reporter.py folder_a/ folder_b/ --output results/report.html
 
