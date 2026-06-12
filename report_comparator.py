@@ -43,6 +43,7 @@ Dependencies:
 
 import re
 import bisect
+import csv
 import difflib
 import argparse
 import sys
@@ -103,6 +104,37 @@ class ComparisonResult:
     page_comparisons: List[Dict] = field(default_factory=list)
 
 
+@dataclass
+class SplitRule:
+    """One row from a --split-config CSV: filename pattern → page-split pattern."""
+    report_re: re.Pattern
+    split_re: re.Pattern
+
+
+def load_split_config(csv_path: str) -> List["SplitRule"]:
+    """Load report_pattern,split_pattern CSV into SplitRule list."""
+    rules: List[SplitRule] = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            rules.append(SplitRule(
+                report_re=re.compile(row["report_pattern"]),
+                split_re=re.compile(row["split_pattern"]),
+            ))
+    return rules
+
+
+def find_split_pattern(filename: str,
+                       rules: Optional[List["SplitRule"]]) -> Optional[re.Pattern]:
+    """Return the first split_re whose report_re matches the filename, else None."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.split_re
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 1.  PAGE SPLITTER
 # ---------------------------------------------------------------------------
@@ -123,8 +155,49 @@ _PAGE_BREAK_RE = re.compile(
 )
 
 
-def split_into_pages(text: str) -> List[List[str]]:
+def _split_by_value_change(text: str, pattern: re.Pattern) -> List[List[str]]:
+    """Split text into pages wherever the value captured by pattern changes.
+
+    Each line is tested with pattern.search().  The captured value is group(1)
+    when the pattern has a capturing group, otherwise the whole match string.
+    Lines that don't match are left in the current page with no break.
+    The line that triggers a value change becomes the first line of the new page.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    all_lines = text.split("\n")
+
+    pages: List[List[str]] = []
+    current: List[str] = []
+    last_val: Optional[str] = None
+
+    def _flush(buf: List[str]) -> None:
+        while buf and not buf[0].strip():
+            buf.pop(0)
+        while buf and not buf[-1].strip():
+            buf.pop()
+        if buf:
+            pages.append(buf)
+
+    for line in all_lines:
+        m = pattern.search(line)
+        if m:
+            val = m.group(1) if m.lastindex else m.group(0)
+            if last_val is not None and val != last_val:
+                _flush(current)
+                current = []
+            last_val = val
+        current.append(line)
+
+    _flush(current)
+    return pages if pages else [all_lines]
+
+
+def split_into_pages(text: str,
+                     split_pattern: Optional[re.Pattern] = None) -> List[List[str]]:
     """Split raw report text into a list of pages (each page = list of lines)."""
+    if split_pattern is not None:
+        return _split_by_value_change(text, split_pattern)
+
     # Normalise line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
@@ -272,7 +345,8 @@ def extract_sections(body_lines: List[str], body_line_numbers: List[int] = None)
 # ---------------------------------------------------------------------------
 
 def parse_report(filename: str, ignore_dates: bool = False,
-                 ignore_line_patterns: Optional[List[str]] = None) -> ParsedReport:
+                 ignore_line_patterns: Optional[List[str]] = None,
+                 split_pattern: Optional[re.Pattern] = None) -> ParsedReport:
     """Top-level parser: read file → pages → header/footer → sections."""
     try:
         with open(filename, "r", encoding="utf-8", errors="replace") as f:
@@ -283,7 +357,7 @@ def parse_report(filename: str, ignore_dates: bool = False,
 
     report = ParsedReport(filename=filename)
 
-    raw_pages = split_into_pages(text)
+    raw_pages = split_into_pages(text, split_pattern=split_pattern)
     global_headers, global_footers = detect_repeating_lines(raw_pages)
 
     report.global_header = global_headers
@@ -1186,11 +1260,13 @@ def compare_folder_pair(path_a: Path,
                         fuzzy_ratio: float,
                         use_semantic: bool,
                         ignore_dates: bool = False,
-                        ignore_line_patterns: Optional[List[str]] = None) -> FilePairOutcome:
+                        ignore_line_patterns: Optional[List[str]] = None,
+                        split_rules: Optional[List[SplitRule]] = None) -> FilePairOutcome:
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
-        ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
-        rb = parse_report(str(path_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
+        split_pat = find_split_pattern(str(path_a), split_rules)
+        ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
+        rb = parse_report(str(path_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
 
         def _filter(lines: List[str], nums: List[int]):
             pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
@@ -1224,7 +1300,8 @@ def run_folder_comparison(folder_a: Path,
                            output_dir: Optional[Path] = None,
                            include_diff: bool = True,
                            ignore_dates: bool = False,
-                           ignore_line_patterns: Optional[List[str]] = None) -> None:
+                           ignore_line_patterns: Optional[List[str]] = None,
+                           split_rules: Optional[List[SplitRule]] = None) -> None:
     """
     Top-level folder comparison.  Scans both folders, matches files,
     runs per-file comparisons, writes individual reports, and writes
@@ -1254,16 +1331,16 @@ def run_folder_comparison(folder_a: Path,
 
     for pa, pb in match.exact_pairs:
         print(f"  Comparing [exact ] {pa.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates, ignore_line_patterns)
+        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules)
 
     for pa, pb, ratio in match.fuzzy_pairs:
         print(f"  Comparing [fuzzy ] {pa.name} ↔ {pb.name}  (name similarity {ratio:.0%})",
               file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates, ignore_line_patterns)
+        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules)
 
     # ---- Master summary ----
     summary_text = _format_folder_summary(
@@ -1282,17 +1359,17 @@ def _write_pair_report(outcome: FilePairOutcome,
                        output_dir: Optional[Path],
                        include_diff: bool,
                        ignore_dates: bool = False,
-                       ignore_line_patterns: Optional[List[str]] = None) -> None:
+                       ignore_line_patterns: Optional[List[str]] = None,
+                       split_rules: Optional[List[SplitRule]] = None) -> None:
     """Write a single pair's comparison report to output_dir (or stdout)."""
     if outcome.error:
         text = (f"ERROR comparing {outcome.file_a.name} ↔ {outcome.file_b.name}\n"
                 f"{outcome.error}\n")
     else:
-        ra = ParsedReport(filename=str(outcome.file_a))
-        rb = ParsedReport(filename=str(outcome.file_b))
+        split_pat = find_split_pattern(str(outcome.file_a), split_rules)
         # Re-parse to get full objects for the formatter
-        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
-        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns)
+        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
+        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
         text = format_report(outcome.result, ra, rb, include_diff=include_diff)
 
     if output_dir:
@@ -1468,6 +1545,9 @@ def main():
                         help="Remove date/time patterns from comparison (ISO, US, timestamps, etc.)")
     parser.add_argument("--ignore-lines", action="append", default=[], metavar="PATTERN",
                         help="Skip lines matching this regex (can be repeated: --ignore-lines PAT1 --ignore-lines PAT2)")
+    parser.add_argument("--split-config", metavar="CSV",
+                        help="CSV with report_pattern,split_pattern columns; "
+                             "matched files use value-change page splitting instead of delimiter patterns")
 
     # ---- single-file options ----
     parser.add_argument("--output", "-o",
@@ -1486,6 +1566,8 @@ def main():
 
     args = parser.parse_args()
 
+    split_rules = load_split_config(args.split_config) if args.split_config else None
+
     path_a = Path(args.source_a)
     path_b = Path(args.source_b)
 
@@ -1503,14 +1585,16 @@ def main():
             include_diff=not args.no_diff,
             ignore_dates=args.ignore_dates,
             ignore_line_patterns=args.ignore_lines or None,
+            split_rules=split_rules,
         )
 
     # ------------------------------------------------------------------ FILE
     elif path_a.is_file() and path_b.is_file():
+        split_pat = find_split_pattern(str(path_a), split_rules)
         print(f"Parsing  : {path_a}", file=sys.stderr)
-        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None)
+        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
         print(f"Parsing  : {path_b}", file=sys.stderr)
-        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None)
+        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
 
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
