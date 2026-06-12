@@ -45,6 +45,7 @@ from report_comparator import (
     scan_folder, match_filenames, compare_folder_pair,
     FolderMatchResult, FilePairOutcome,
     diff_opcodes,
+    load_split_config, SplitRule,
 )
 
 BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
@@ -922,7 +923,7 @@ function renderPages(el){
       const sim=(ratio*100).toFixed(1)+'%';
       const chg=`+${add} −${ndel}`;
       const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
-      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">&#9658; diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
       tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td></tr>`;
       if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
     }else if(pg[0]===1){
@@ -941,8 +942,10 @@ async function toggle(btn,id){
   const wasOpen=el.classList.contains('open');
   if(!wasOpen){
     if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
-    const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
-    if(target&&!target.dataset.rendered)await renderDiff(target);
+    else{
+      const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
+      if(target&&!target.dataset.rendered)await renderDiff(target);
+    }
   }
   el.classList.toggle('open');
   btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶',wasOpen?'▶':'▼');
@@ -1105,7 +1108,8 @@ def run(folder_a: Path, folder_b: Path,
         windows_base: Optional[str],
         bcompare_exe: str,
         ignore_dates: bool = False,
-        ignore_line_patterns: Optional[List[str]] = None) -> None:
+        ignore_line_patterns: Optional[List[str]] = None,
+        split_rules: Optional[List[SplitRule]] = None) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1131,7 +1135,7 @@ def run(folder_a: Path, folder_b: Path,
 
     for i, (pa, pb, mtype, mratio) in enumerate(all_pairs):
         print(f"  Comparing [{mtype:5}] {pa.name} ↔ {pb.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns)
+        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
         outcomes.append(outcome)
 
         win_a, url_a = resolve_paths(pa, linux_base, windows_base)
@@ -1194,6 +1198,9 @@ def main():
     p.add_argument("--bcompare",
                    default=BCOMPARE_DEFAULT_WIN,
                    help=f"Path to BCompare.exe (default: {BCOMPARE_DEFAULT_WIN})")
+    p.add_argument("--split-config", metavar="CSV",
+                   help="CSV with report_pattern,split_pattern columns; "
+                        "matched files use value-change page splitting instead of delimiter patterns")
 
     args = p.parse_args()
 
@@ -1210,6 +1217,7 @@ def main():
         bcompare_exe   = args.bcompare,
         ignore_dates          = args.ignore_dates,
         ignore_line_patterns  = args.ignore_lines or None,
+        split_rules           = load_split_config(args.split_config) if args.split_config else None,
     )
 
 
