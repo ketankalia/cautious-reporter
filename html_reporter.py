@@ -5,9 +5,6 @@ Generates a self-contained HTML comparison report from two folders of text
 reports, using the comparison engine in report_comparator.py.
 
 Usage:
-
-# python report_comparator.py folder_a/ folder_b/ --split-config splits.csv
-# python html_reporter.py folder_a/ folder_b/ --output report.html --split-config splits.csv
     # Basic (paths resolved from wherever the script runs)
     python html_reporter.py folder_a/ folder_b/ --output results/report.html
 
@@ -397,7 +394,8 @@ def sections_table(sections: List[dict]) -> str:
 def pages_panel(page_comparisons: List[dict],
                 per_page_lines: List[Tuple[List[str], List[str]]],
                 panel_id: str,
-                per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None) -> Tuple[str, str]:
+                per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None,
+                per_page_txn_comparisons: Optional[List[List[dict]]] = None) -> Tuple[str, str]:
     """Return (toggle_html, panel_html) for per-page comparison.
     Returns ('', '') when there is nothing to show (single-page files).
     Table content is deferred: stored as JSON in a <script> tag, built by
@@ -450,8 +448,54 @@ def pages_panel(page_comparisons: List[dict],
                 )
                 diff_id = diff_pid
 
-            # [0, page_num_a, page_num_b, ratio, lines_added, lines_deleted, lnr, diff_id_or_null]
-            pages.append([0, pc["page_num_a"], pc["page_num_b"], r, add, ndel, lnr, diff_id])
+            # Build transaction sub-panel when txn data is available for this page
+            txn_src_id = None
+            txn_comps = (
+                per_page_txn_comparisons[matched_idx]
+                if per_page_txn_comparisons and matched_idx < len(per_page_txn_comparisons)
+                else None
+            )
+            if txn_comps is not None and len(txn_comps) > 0:
+                txn_entries: list = []
+                for ti, tc in enumerate(txn_comps):
+                    key = tc["sort_key"]
+                    if tc["status"] == "matched":
+                        tr = tc["diff"]["similarity_ratio"]
+                        ta = tc["diff"]["lines_added"]
+                        td = tc["diff"]["lines_deleted"]
+                        txn_diff_id = None
+                        if tr < 1.0:
+                            txn_did = f"{panel_id}-pd{matched_idx}-tx{ti}"
+                            tla = tc["txn_a"].lines
+                            tlb = tc["txn_b"].lines
+                            tna = tc["txn_a"].line_numbers or None
+                            tnb = tc["txn_b"].line_numbers or None
+                            script_tags.append(
+                                _diff_tag(txn_did, _diff_rows(tla, tlb, line_nums_a=tna, line_nums_b=tnb))
+                            )
+                            txn_diff_id = txn_did
+                        # [0, sort_key, ratio, add, del, diff_id_or_null]
+                        txn_entries.append([0, key, tr, ta, td, txn_diff_id])
+                    elif tc["status"] == "added":
+                        lines_count = len(tc["txn_b"].lines)
+                        txn_entries.append([1, key, lines_count])
+                    else:
+                        lines_count = len(tc["txn_a"].lines)
+                        txn_entries.append([2, key, lines_count])
+
+                txn_src_id = f"{panel_id}-pd{matched_idx}-txn-data"
+                n_m = sum(1 for t in txn_comps if t["status"] == "matched")
+                n_a = sum(1 for t in txn_comps if t["status"] == "added")
+                n_r = sum(1 for t in txn_comps if t["status"] == "removed")
+                txn_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r},
+                            "txns": txn_entries}
+                script_tags.append(
+                    f'<script type="application/json" id="{txn_src_id}">'
+                    f'{_json.dumps(txn_data, separators=(",",":"))}</script>'
+                )
+
+            # [0, page_num_a, page_num_b, ratio, add, del, lnr, diff_id, txn_src_id_or_null]
+            pages.append([0, pc["page_num_a"], pc["page_num_b"], r, add, ndel, lnr, diff_id, txn_src_id])
             matched_idx += 1
         elif pc["status"] == "added":
             # [1, page_num_b, lines]
@@ -488,7 +532,8 @@ def pair_card(outcome: FilePairOutcome,
               card_id: str,
               body_lines_a: List[str],
               body_lines_b: List[str],
-              per_page_lines: Optional[List[Tuple[List[str], List[str]]]] = None) -> str:
+              per_page_lines: Optional[List[Tuple[List[str], List[str]]]] = None,
+              per_page_txn_comparisons: Optional[List[List[dict]]] = None) -> str:
 
     if outcome.error:
         return (
@@ -517,11 +562,16 @@ def pair_card(outcome: FilePairOutcome,
     eff_pcs = r.page_comparisons
     eff_ppl = per_page_lines or []
     eff_pln: Optional[List[Tuple[List[int], List[int]]]] = outcome.per_page_line_numbers or None
+    eff_ptxn: Optional[List[List[dict]]] = (
+        per_page_txn_comparisons if per_page_txn_comparisons is not None
+        else (outcome.per_page_txn_comparisons if outcome.per_page_txn_comparisons else None)
+    )
 
     if not eff_pcs and r.sections:
         eff_pcs = []
         eff_ppl = []
         eff_pln = []
+        eff_ptxn = None   # synthesised pages have no pre-computed txn data
         for sec in r.sections:
             title_a = sec.get("title_a", sec.get("title_b", "Page 0"))
             title_b = sec.get("title_b", sec.get("title_a", "Page 0"))
@@ -549,7 +599,7 @@ def pair_card(outcome: FilePairOutcome,
                 eff_pcs.append({"status": "added", "page_num_a": None,
                                 "page_num_b": pnum_b, "lines": sec["lines"]})
 
-    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln)
+    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln, eff_ptxn)
 
     # Build the diff panel (only when there are differences)
     if ratio < 1.0 and (body_lines_a or body_lines_b):
@@ -786,7 +836,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .no-results{text-align:center;color:var(--muted);padding:40px;font-size:14px}
 
 /* Diff panel */
-.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;overflow-y:auto;max-height:600px}
+.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;overflow-y:auto;max-height:min(600px,calc(100vh - 120px))}
 .diff-wrap.open{display:block}
 .diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
 .diff-toolbar{display:flex;justify-content:space-between;align-items:center;
@@ -820,6 +870,13 @@ mark.wi{background:#bbf7d0;color:#14532d;border-radius:2px;padding:0 1px}
 
 /* Toggle button variants */
 .card-toggle.no-diff{color:var(--identical);cursor:default}
+
+/* Transaction panel */
+.txn-detail{padding:10px 0 4px}
+.txn-summary{font-size:12px;color:var(--muted);margin-bottom:8px}
+.txn-table td.mono{font-family:'Cascadia Code','Consolas',monospace;font-size:12px}
+.txn-toggle{margin-left:6px}
+.diff-row.txn-panel-row td{padding:0 0 0 24px;border-top:none}
 
 /* Page-level filter bar (inside each card's pages panel) */
 .pg-filter-bar{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
@@ -901,11 +958,54 @@ async function renderDiff(el){
       +'<thead><tr><th class="ln">A</th><th class="ln">B</th><th>Content</th></tr></thead>';
     tbl.appendChild(tbody);
     el.appendChild(tbl);
+    // Clamp height so the panel + scrollbar stay within the viewport
+    const rect=el.getBoundingClientRect();
+    const spare=window.innerHeight-rect.top-40;
+    if(spare>80&&spare<el.clientHeight)el.style.maxHeight=spare+'px';
     el.addEventListener('scroll',()=>applyDiffWindow(state,el.scrollTop));
   }catch(e){
     el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
   }
   el.dataset.rendered='1';
+}
+function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function renderTxnPanel(el,txnSrcId){
+  if(el.dataset.rendered)return;
+  const script=document.getElementById(txnSrcId);
+  if(!script)return;
+  const d=JSON.parse(script.textContent);
+  const s=d.summary;
+  let hdr=`<div class="txn-summary">Transactions: <strong>${s.matched}</strong> matched`;
+  if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
+  if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
+  hdr+='</div>';
+  let tb='';
+  for(const t of d.txns){
+    if(t[0]===0){
+      const[,key,ratio,add,ndel,did]=t;
+      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+      const sim=(ratio*100).toFixed(1)+'%';
+      const chg=`+${add} −${ndel}`;
+      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+      tb+=`<tr class="${css}"><td class="mono">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
+      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Txn: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
+    }else if(t[0]===1){
+      tb+=`<tr class="s-added"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
+    }else{
+      tb+=`<tr class="s-removed"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
+    }
+  }
+  el.insertAdjacentHTML('beforeend',hdr+`<table class="sec-table txn-table"><thead><tr><th>Sort Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`);
+  el.dataset.rendered='1';
+}
+function toggleTxnPanel(btn,rowId,txnSrcId){
+  const row=document.getElementById(rowId);
+  const detail=row.querySelector('.txn-detail');
+  const wasOpen=row.classList.contains('open');
+  if(!wasOpen&&!detail.dataset.rendered)renderTxnPanel(detail,txnSrcId);
+  row.classList.toggle('open');
+  btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶',wasOpen?'▶':'▼');
 }
 function renderPages(el){
   if(el.dataset.rendered)return;
@@ -918,17 +1018,22 @@ function renderPages(el){
   let fb=`<button class="pf-btn pf-all active" onclick="setPageFilter('${pid}','all')">All (${total})</button>`;
   for(const[css,lbl]of SM){const cnt=d.counts[css]||0;if(cnt)fb+=`<button class="pf-btn pf-${css}" onclick="setPageFilter('${pid}','${css}')"><span class="pf-dot ${css}"></span>${lbl} (${cnt})</button>`;}
   let tb='';
+  let pgIdx=0;
   for(const pg of d.pages){
     if(pg[0]===0){
-      const[,pna,pnb,ratio,add,ndel,lnr,did]=pg;
+      const[,pna,pnb,ratio,add,ndel,lnr,did,txnSrc]=pg;
       const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
       const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
       const sim=(ratio*100).toFixed(1)+'%';
       const chg=`+${add} −${ndel}`;
       const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
       const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
-      tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td></tr>`;
+      const txnRowId=`${pid}-txnrow-${pgIdx}`;
+      const txnBtn=txnSrc?` <span class="card-toggle txn-toggle" onclick="toggleTxnPanel(this,'${txnRowId}','${txnSrc}')">▶ txn</span>`:'';
+      tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}${txnBtn}</td></tr>`;
       if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
+      if(txnSrc)tb+=`<tr class="diff-row txn-panel-row" id="${txnRowId}"><td colspan="5"><div class="txn-detail sec-detail"></div></td></tr>`;
+      pgIdx++;
     }else if(pg[0]===1){
       const[,pnb,lines]=pg;
       tb+=`<tr class="s-added"><td>Page ${pnb}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
@@ -1112,7 +1217,8 @@ def run(folder_a: Path, folder_b: Path,
         bcompare_exe: str,
         ignore_dates: bool = False,
         ignore_line_patterns: Optional[List[str]] = None,
-        split_rules: Optional[List[SplitRule]] = None) -> None:
+        split_rules: Optional[List[SplitRule]] = None,
+        transactions: bool = False) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1138,7 +1244,7 @@ def run(folder_a: Path, folder_b: Path,
 
     for i, (pa, pb, mtype, mratio) in enumerate(all_pairs):
         print(f"  Comparing [{mtype:5}] {pa.name} ↔ {pb.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
+        outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
         outcomes.append(outcome)
 
         win_a, url_a = resolve_paths(pa, linux_base, windows_base)
@@ -1157,7 +1263,8 @@ def run(folder_a: Path, folder_b: Path,
         card_id = f"card-{i}"
         cards_html += pair_card(outcome, bat_url, url_a, url_b,
                                  win_a, win_b, bcompare_exe, card_id,
-                                 body_a, body_b, per_page_lines)
+                                 body_a, body_b, per_page_lines,
+                                 per_page_txn_comparisons=outcome.per_page_txn_comparisons or None)
 
     unmatched_html = unmatched_section(match.only_in_a, match.only_in_b,
                                         linux_base, windows_base)
@@ -1202,8 +1309,11 @@ def main():
                    default=BCOMPARE_DEFAULT_WIN,
                    help=f"Path to BCompare.exe (default: {BCOMPARE_DEFAULT_WIN})")
     p.add_argument("--split-config", metavar="CSV",
-                   help="CSV with report_pattern,split_pattern columns; "
+                   help="CSV with report_pattern,split_pattern[,sort_pattern] columns; "
                         "matched files use value-change page splitting instead of delimiter patterns")
+    p.add_argument("--transactions", action="store_true",
+                   help="Enable transaction-level comparison within pages; "
+                        "transactions identified by date/time anchors or sort_pattern in --split-config")
 
     args = p.parse_args()
 
@@ -1221,6 +1331,7 @@ def main():
         ignore_dates          = args.ignore_dates,
         ignore_line_patterns  = args.ignore_lines or None,
         split_rules           = load_split_config(args.split_config) if args.split_config else None,
+        transactions          = args.transactions,
     )
 
 
