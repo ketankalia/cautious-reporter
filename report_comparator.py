@@ -118,18 +118,21 @@ class SplitRule:
     report_re: re.Pattern
     split_re: re.Pattern
     sort_re: Optional[re.Pattern] = None
+    max_txn_lines: Optional[int] = None
 
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
-    """Load report_pattern,split_pattern[,sort_pattern] CSV into SplitRule list."""
+    """Load report_pattern,split_pattern[,sort_pattern[,max_txn_lines]] CSV into SplitRule list."""
     rules: List[SplitRule] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             sort_pat = row.get("sort_pattern", "").strip()
+            mtl_raw  = row.get("max_txn_lines", "").strip()
             rules.append(SplitRule(
                 report_re=re.compile(row["report_pattern"]),
                 split_re=re.compile(row["split_pattern"]),
                 sort_re=re.compile(sort_pat) if sort_pat else None,
+                max_txn_lines=int(mtl_raw) if mtl_raw else None,
             ))
     return rules
 
@@ -155,6 +158,18 @@ def find_sort_pattern(filename: str,
     for rule in rules:
         if rule.report_re.search(name):
             return rule.sort_re
+    return None
+
+
+def find_max_txn_lines(filename: str,
+                       rules: Optional[List["SplitRule"]]) -> Optional[int]:
+    """Return max_txn_lines for the first matching rule, else None (unlimited)."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.max_txn_lines
     return None
 
 
@@ -924,17 +939,22 @@ def identify_transactions(
     lines: List[str],
     line_numbers: List[int],
     sort_re: Optional[re.Pattern] = None,
+    max_txn_lines: Optional[int] = None,
 ) -> List[Transaction]:
-    """Identify transaction blocks within a page's body lines.
+    """Identify transaction blocks within a body line list.
 
-    With sort_re: each value-change on the captured group starts a new block
-    (same logic as _split_by_value_change but returns Transaction objects).
+    With sort_re (two-pass): every line that matches sort_re unconditionally
+    starts a new transaction, even when the captured value repeats.  Each
+    transaction block runs from its match line up to (but not including) the
+    next match line, capped at max_txn_lines if set; leading/trailing blank
+    lines are stripped.  Lines before the first match are not assigned to any
+    transaction.
 
-    Without sort_re: lines containing date/time patterns are anchors; blank
-    lines close the current block.  Pre-anchor lines (e.g. an ID field before
-    the date field) are absorbed into the block they precede.
+    Without sort_re (date-anchor mode): lines containing date/time patterns
+    are anchors; blank lines close the current block.  Non-date lines before
+    the first anchor in a block are absorbed into that block.
 
-    Returns [] when no transactions are detected → caller falls back to line diff.
+    Returns [] when no transactions are detected.
     """
     if not lines:
         return []
@@ -943,39 +963,35 @@ def identify_transactions(
     txns: List[Transaction] = []
 
     if sort_re is not None:
-        cur_lines: List[str] = []
-        cur_nums: List[int] = []
-        last_val: Optional[str] = None
+        # Two-pass: collect match positions first so each match unconditionally
+        # starts a new transaction — same-value duplicates (e.g. two card
+        # transactions sharing a sequence number) are kept separate.
+        match_idx: List[int] = []
+        for i, ln in enumerate(lines):
+            if sort_re.search(ln):
+                match_idx.append(i)
 
-        def _flush_val() -> None:
-            s, e = 0, len(cur_lines)
-            while s < e and not cur_lines[s].strip():
+        for k, mi in enumerate(match_idx):
+            end = match_idx[k + 1] if k + 1 < len(match_idx) else len(lines)
+            if max_txn_lines is not None:
+                end = min(end, mi + max_txn_lines)
+            m   = sort_re.search(lines[mi])
+            val = m.group(1) if m.lastindex else m.group(0)
+            blk_l = lines[mi:end]
+            blk_n = nums[mi:end]
+            s, e = 0, len(blk_l)
+            while s < e and not blk_l[s].strip():
                 s += 1
-            while e > s and not cur_lines[e - 1].strip():
+            while e > s and not blk_l[e - 1].strip():
                 e -= 1
-            blk = cur_lines[s:e]
+            blk = blk_l[s:e]
             if blk:
-                key = last_val or ""
                 txns.append(Transaction(
-                    sort_key=key,
-                    sort_val=_parse_sort_val(key),
+                    sort_key=val,
+                    sort_val=_parse_sort_val(val),
                     lines=blk,
-                    line_numbers=cur_nums[s:e],
+                    line_numbers=blk_n[s:e],
                 ))
-
-        for ln, num in zip(lines, nums):
-            m = sort_re.search(ln)
-            if m:
-                val = m.group(1) if m.lastindex else m.group(0)
-                if last_val is not None and val != last_val:
-                    _flush_val()
-                    cur_lines, cur_nums = [], []
-                last_val = val
-            cur_lines.append(ln)
-            cur_nums.append(num)
-
-        if cur_lines and last_val is not None:
-            _flush_val()
 
     else:
         # Date-anchor mode: has_dates() marks anchor lines; blank lines close blocks.
@@ -1074,6 +1090,25 @@ def compare_transactions(txns_a: List[Transaction],
             else:
                 results.append({"status": "added",   "sort_key": key, "txn_b": bs_[i]})
     return results
+
+
+def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
+    """Write transaction comparison results to a CSV file."""
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["sort_key", "status", "similarity_pct", "lines_added", "lines_deleted"])
+        for tc in file_txn_comparisons:
+            key    = tc["sort_key"]
+            status = tc["status"]
+            if status == "matched":
+                d = tc["diff"]
+                w.writerow([key, status,
+                             round(d["similarity_ratio"] * 100, 1),
+                             d["lines_added"], d["lines_deleted"]])
+            elif status == "added":
+                w.writerow([key, status, 0, len(tc["txn_b"].lines), 0])
+            else:
+                w.writerow([key, status, 0, 0, len(tc["txn_a"].lines)])
 
 
 # ---------------------------------------------------------------------------
@@ -1528,10 +1563,11 @@ def compare_folder_pair(path_a: Path,
 
         file_txn: List[Dict] = []
         if transactions:
-            sort_re = find_sort_pattern(str(path_a), split_rules)
+            sort_re    = find_sort_pattern(str(path_a), split_rules)
+            max_txn_ln = find_max_txn_lines(str(path_a), split_rules)
             if sort_re is not None:
-                txns_a = identify_transactions(body_a, nums_a, sort_re)
-                txns_b = identify_transactions(body_b, nums_b, sort_re)
+                txns_a = identify_transactions(body_a, nums_a, sort_re, max_txn_ln)
+                txns_b = identify_transactions(body_b, nums_b, sort_re, max_txn_ln)
                 if txns_a or txns_b:
                     file_txn = compare_transactions(txns_a, txns_b)
 
@@ -1639,6 +1675,10 @@ def _write_pair_report(outcome: FilePairOutcome,
             stem = outcome.file_a.stem
         out_path = output_dir / f"{stem}_comparison.txt"
         out_path.write_text(text, encoding="utf-8")
+        if outcome.file_txn_comparisons:
+            csv_path = output_dir / f"{stem}_txn.csv"
+            write_txn_csv(outcome.file_txn_comparisons, csv_path)
+            print(f"    TXN CSV → {csv_path}", file=sys.stderr)
     else:
         print(text)
         print()
@@ -1853,8 +1893,9 @@ def main():
 
     # ------------------------------------------------------------------ FILE
     elif path_a.is_file() and path_b.is_file():
-        split_pat = find_split_pattern(str(path_a), split_rules)
-        sort_re   = find_sort_pattern(str(path_a), split_rules)
+        split_pat  = find_split_pattern(str(path_a), split_rules)
+        sort_re    = find_sort_pattern(str(path_a), split_rules)
+        max_txn_ln = find_max_txn_lines(str(path_a), split_rules)
         print(f"Parsing  : {path_a}", file=sys.stderr)
         report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
         print(f"Parsing  : {path_b}", file=sys.stderr)
@@ -1867,8 +1908,8 @@ def main():
         if args.transactions and sort_re is not None:
             body_a = [l for l in report_a.body_lines if l.strip()]
             body_b = [l for l in report_b.body_lines if l.strip()]
-            txns_a = identify_transactions(body_a, report_a.body_line_numbers, sort_re)
-            txns_b = identify_transactions(body_b, report_b.body_line_numbers, sort_re)
+            txns_a = identify_transactions(body_a, report_a.body_line_numbers, sort_re, max_txn_ln)
+            txns_b = identify_transactions(body_b, report_b.body_line_numbers, sort_re, max_txn_ln)
             txn_comps = compare_transactions(txns_a, txns_b) if (txns_a or txns_b) else []
 
         output = format_report(result, report_a, report_b,
@@ -1876,8 +1917,13 @@ def main():
                                 txn_comparisons=txn_comps)
 
         if args.output:
-            Path(args.output).write_text(output, encoding="utf-8")
+            out_p = Path(args.output)
+            out_p.write_text(output, encoding="utf-8")
             print(f"Saved to : {args.output}", file=sys.stderr)
+            if txn_comps:
+                csv_path = out_p.parent / f"{out_p.stem}_txn.csv"
+                write_txn_csv(txn_comps, csv_path)
+                print(f"TXN CSV  → {csv_path}", file=sys.stderr)
         else:
             print(output)
 
