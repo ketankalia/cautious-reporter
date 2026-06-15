@@ -94,11 +94,17 @@ def filter_lines(lines: List[str]) -> List[str]:
 def has_dates(line: str) -> bool:
     """
     Check if a line contains any date/time patterns.
-    
+
     Args:
         line: A line of text
-    
+
     Returns:
         True if line contains date/time patterns, False otherwise
     """
     return bool(_DATE_TIME_RE.search(line))
+
+
+def first_date_match(line: str) -> str:
+    """Return the first date/time string found in line, or empty string."""
+    m = _DATE_TIME_RE.search(line)
+    return m.group(0) if m else ""
