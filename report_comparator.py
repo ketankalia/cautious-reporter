@@ -54,7 +54,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple, Set
 
-from date_utils import filter_lines
+from date_utils import filter_lines, has_dates, first_date_match
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +84,14 @@ class Section:
 
 
 @dataclass
+class Transaction:
+    sort_key: str          # raw extracted key string (used for matching A↔B)
+    sort_val: object       # comparable: datetime | float | str (used for ordering)
+    lines: List[str] = field(default_factory=list)
+    line_numbers: List[int] = field(default_factory=list)
+
+
+@dataclass
 class ParsedReport:
     filename: str
     pages: List[Page] = field(default_factory=list)
@@ -106,19 +114,22 @@ class ComparisonResult:
 
 @dataclass
 class SplitRule:
-    """One row from a --split-config CSV: filename pattern → page-split pattern."""
+    """One row from a --split-config CSV: filename pattern → page-split + optional sort pattern."""
     report_re: re.Pattern
     split_re: re.Pattern
+    sort_re: Optional[re.Pattern] = None
 
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
-    """Load report_pattern,split_pattern CSV into SplitRule list."""
+    """Load report_pattern,split_pattern[,sort_pattern] CSV into SplitRule list."""
     rules: List[SplitRule] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
+            sort_pat = row.get("sort_pattern", "").strip()
             rules.append(SplitRule(
                 report_re=re.compile(row["report_pattern"]),
                 split_re=re.compile(row["split_pattern"]),
+                sort_re=re.compile(sort_pat) if sort_pat else None,
             ))
     return rules
 
@@ -132,6 +143,18 @@ def find_split_pattern(filename: str,
     for rule in rules:
         if rule.report_re.search(name):
             return rule.split_re
+    return None
+
+
+def find_sort_pattern(filename: str,
+                      rules: Optional[List["SplitRule"]]) -> Optional[re.Pattern]:
+    """Return the first sort_re whose report_re matches the filename, else None."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.sort_re
     return None
 
 
@@ -861,6 +884,199 @@ def compare_sections(sections_a: List[Section],
 
 
 # ---------------------------------------------------------------------------
+# 7b. TRANSACTION DETECTION  (enabled by --transactions)
+# ---------------------------------------------------------------------------
+
+from datetime import datetime as _dt
+
+_SORT_DT_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d", "%Y/%m/%d",
+    "%m/%d/%Y", "%d/%m/%Y",
+    "%d-%b-%Y", "%b %d, %Y", "%B %d, %Y",
+)
+
+
+def _parse_sort_val(raw: str) -> object:
+    """Parse a sort-key string → datetime | float | str for ordering."""
+    s = raw.strip()
+    for fmt in _SORT_DT_FORMATS:
+        try:
+            return _dt.strptime(s, fmt)
+        except ValueError:
+            pass
+    try:
+        return float(s.replace(",", ""))
+    except ValueError:
+        return s
+
+
+def _sort_key_comparable(val: object) -> tuple:
+    """Return a (type_rank, value) tuple so datetimes, floats, and strings can be sorted together."""
+    if isinstance(val, _dt):
+        return (0, val.timestamp())
+    if isinstance(val, float):
+        return (1, val)
+    return (2, str(val))
+
+
+def identify_transactions(
+    lines: List[str],
+    line_numbers: List[int],
+    sort_re: Optional[re.Pattern] = None,
+) -> List[Transaction]:
+    """Identify transaction blocks within a page's body lines.
+
+    With sort_re: each value-change on the captured group starts a new block
+    (same logic as _split_by_value_change but returns Transaction objects).
+
+    Without sort_re: lines containing date/time patterns are anchors; blank
+    lines close the current block.  Pre-anchor lines (e.g. an ID field before
+    the date field) are absorbed into the block they precede.
+
+    Returns [] when no transactions are detected → caller falls back to line diff.
+    """
+    if not lines:
+        return []
+
+    nums = line_numbers if line_numbers else list(range(1, len(lines) + 1))
+    txns: List[Transaction] = []
+
+    if sort_re is not None:
+        cur_lines: List[str] = []
+        cur_nums: List[int] = []
+        last_val: Optional[str] = None
+
+        def _flush_val() -> None:
+            s, e = 0, len(cur_lines)
+            while s < e and not cur_lines[s].strip():
+                s += 1
+            while e > s and not cur_lines[e - 1].strip():
+                e -= 1
+            blk = cur_lines[s:e]
+            if blk:
+                key = last_val or ""
+                txns.append(Transaction(
+                    sort_key=key,
+                    sort_val=_parse_sort_val(key),
+                    lines=blk,
+                    line_numbers=cur_nums[s:e],
+                ))
+
+        for ln, num in zip(lines, nums):
+            m = sort_re.search(ln)
+            if m:
+                val = m.group(1) if m.lastindex else m.group(0)
+                if last_val is not None and val != last_val:
+                    _flush_val()
+                    cur_lines, cur_nums = [], []
+                last_val = val
+            cur_lines.append(ln)
+            cur_nums.append(num)
+
+        if cur_lines and last_val is not None:
+            _flush_val()
+
+    else:
+        # Date-anchor mode: has_dates() marks anchor lines; blank lines close blocks.
+        # pend_* accumulates non-date lines before the first date in a block so they
+        # are absorbed into that block (e.g. "INVOICE NO: INV-001" before "DATE: ...").
+        cur_lines: List[str] = []
+        cur_nums: List[int] = []
+        pend_lines: List[str] = []
+        pend_nums: List[int] = []
+        anchored = False
+
+        def _flush_date() -> None:
+            nonlocal anchored
+            block = pend_lines + cur_lines
+            bnums = pend_nums + cur_nums
+            s, e = 0, len(block)
+            while s < e and not block[s].strip():
+                s += 1
+            while e > s and not block[e - 1].strip():
+                e -= 1
+            blk = block[s:e]
+            if blk:
+                key = first_date_match(next((l for l in blk if has_dates(l)), ""))
+                txns.append(Transaction(
+                    sort_key=key,
+                    sort_val=_parse_sort_val(key) if key else "",
+                    lines=blk,
+                    line_numbers=bnums[s:e],
+                ))
+            anchored = False
+
+        for ln, num in zip(lines, nums):
+            if not ln.strip():
+                if anchored:
+                    _flush_date()
+                    cur_lines, cur_nums = [], []
+                pend_lines, pend_nums = [], []
+            elif has_dates(ln):
+                if not anchored:
+                    anchored = True
+                    cur_lines = [ln]
+                    cur_nums = [num]
+                else:
+                    cur_lines.append(ln)
+                    cur_nums.append(num)
+            else:
+                if anchored:
+                    cur_lines.append(ln)
+                    cur_nums.append(num)
+                else:
+                    pend_lines.append(ln)
+                    pend_nums.append(num)
+
+        if anchored and cur_lines:
+            _flush_date()
+
+    return txns
+
+
+def compare_transactions(txns_a: List[Transaction],
+                         txns_b: List[Transaction]) -> List[Dict]:
+    """Match transactions by sort_key and return matched/added/removed dicts.
+
+    Transactions with the same sort_key are paired by index within the group
+    (first-in-A with first-in-B, etc.) to handle duplicate keys.
+    """
+    from collections import defaultdict
+
+    groups_a: Dict[str, List[Transaction]] = defaultdict(list)
+    groups_b: Dict[str, List[Transaction]] = defaultdict(list)
+    for t in txns_a:
+        groups_a[t.sort_key].append(t)
+    for t in txns_b:
+        groups_b[t.sort_key].append(t)
+
+    all_keys = sorted(
+        set(groups_a) | set(groups_b),
+        key=lambda k: _sort_key_comparable(_parse_sort_val(k)),
+    )
+
+    results: List[Dict] = []
+    for key in all_keys:
+        as_ = groups_a.get(key, [])
+        bs_ = groups_b.get(key, [])
+        for i in range(max(len(as_), len(bs_))):
+            if i < len(as_) and i < len(bs_):
+                results.append({
+                    "status":   "matched",
+                    "sort_key": key,
+                    "txn_a":    as_[i],
+                    "txn_b":    bs_[i],
+                    "diff":     line_diff_stats(as_[i].lines, bs_[i].lines),
+                })
+            elif i < len(as_):
+                results.append({"status": "removed", "sort_key": key, "txn_a": as_[i]})
+            else:
+                results.append({"status": "added",   "sort_key": key, "txn_b": bs_[i]})
+    return results
+
+
+# ---------------------------------------------------------------------------
 # 8.  TOP-LEVEL COMPARISON
 # ---------------------------------------------------------------------------
 
@@ -1003,7 +1219,8 @@ def _verdict(ratio: float) -> str:
 def format_report(result: ComparisonResult,
                   report_a: ParsedReport,
                   report_b: ParsedReport,
-                  include_diff: bool = True) -> str:
+                  include_diff: bool = True,
+                  txn_comparisons_per_page: Optional[List[List[Dict]]] = None) -> str:
     lines = []
 
     def h(title: str, char: str = "="):
@@ -1100,7 +1317,7 @@ def format_report(result: ComparisonResult,
     if include_diff:
         if result.page_comparisons:
             h("PER-PAGE DIFF", "-")
-            for pc in result.page_comparisons:
+            for pg_idx, pc in enumerate(result.page_comparisons):
                 if pc["status"] == "matched":
                     lines.append("")
                     lines.append(f"  {'─' * 56}")
@@ -1111,10 +1328,44 @@ def format_report(result: ComparisonResult,
                         f"Change: {d['change_pct']:.1f}%   "
                         f"+{d['lines_added']} / -{d['lines_deleted']} lines"
                     )
-                    if pc["diff_text"].strip():
-                        lines.append(pc["diff_text"])
+
+                    # Transaction mode: show per-transaction summary when available
+                    txn_comps = (
+                        txn_comparisons_per_page[pg_idx]
+                        if txn_comparisons_per_page and pg_idx < len(txn_comparisons_per_page)
+                        else None
+                    )
+                    if txn_comparisons_per_page is not None:
+                        if txn_comps:
+                            n_m = sum(1 for t in txn_comps if t["status"] == "matched")
+                            n_a = sum(1 for t in txn_comps if t["status"] == "added")
+                            n_r = sum(1 for t in txn_comps if t["status"] == "removed")
+                            lines.append(f"  Transactions: {n_m} matched, {n_a} added, {n_r} removed")
+                            for tc in txn_comps:
+                                key = tc["sort_key"] or "(no key)"
+                                if tc["status"] == "matched":
+                                    r2 = tc["diff"]["similarity_ratio"]
+                                    flag = (f"  similarity: {r2:.1%}"
+                                            if r2 < 1.0 else "  identical")
+                                    chg = (f"  +{tc['diff']['lines_added']}/"
+                                           f"-{tc['diff']['lines_deleted']}"
+                                           if r2 < 1.0 else "")
+                                    lines.append(f"    [MATCHED ] {key}{flag}{chg}")
+                                elif tc["status"] == "added":
+                                    lines.append(f"    [ADDED   ] {key}")
+                                else:
+                                    lines.append(f"    [REMOVED ] {key}")
+                        else:
+                            lines.append("  (no transactions detected — line diff shown)")
+                            if pc["diff_text"].strip():
+                                lines.append(pc["diff_text"])
+                            else:
+                                lines.append("  (identical)")
                     else:
-                        lines.append("  (identical)")
+                        if pc["diff_text"].strip():
+                            lines.append(pc["diff_text"])
+                        else:
+                            lines.append("  (identical)")
                 elif pc["status"] == "added":
                     lines.append("")
                     lines.append(f"  [ADDED  ] Page {pc['page_num_b']} (only in B, {pc['lines']} lines)")
@@ -1252,6 +1503,8 @@ class FilePairOutcome:
     body_line_numbers_b: List[int] = field(default_factory=list)
     per_page_lines: List[Tuple[List[str], List[str]]] = field(default_factory=list)
     per_page_line_numbers: List[Tuple[List[int], List[int]]] = field(default_factory=list)
+    # per-page transaction comparisons; empty list = no transactions detected on that page
+    per_page_txn_comparisons: List[List[Dict]] = field(default_factory=list)
 
 
 def compare_folder_pair(path_a: Path,
@@ -1261,7 +1514,8 @@ def compare_folder_pair(path_a: Path,
                         use_semantic: bool,
                         ignore_dates: bool = False,
                         ignore_line_patterns: Optional[List[str]] = None,
-                        split_rules: Optional[List[SplitRule]] = None) -> FilePairOutcome:
+                        split_rules: Optional[List[SplitRule]] = None,
+                        transactions: bool = False) -> FilePairOutcome:
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
         split_pat = find_split_pattern(str(path_a), split_rules)
@@ -1281,11 +1535,26 @@ def compare_folder_pair(path_a: Path,
             plb, pnb = _filter(rb.pages[i].body_lines, rb.pages[i].body_line_numbers)
             per_page.append((pla, plb))
             per_page_nums.append((pna, pnb))
+
+        per_page_txn: List[List[Dict]] = []
+        if transactions:
+            sort_re = find_sort_pattern(str(path_a), split_rules)
+            for i in range(n_matched):
+                pla, plb = per_page[i]
+                pna, pnb = per_page_nums[i]
+                txns_a = identify_transactions(pla, pna, sort_re)
+                txns_b = identify_transactions(plb, pnb, sort_re)
+                if txns_a or txns_b:
+                    per_page_txn.append(compare_transactions(txns_a, txns_b))
+                else:
+                    per_page_txn.append([])  # no transactions detected → line-diff fallback
+
         result = compare_reports(ra, rb, use_semantic=use_semantic)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
                                body_lines_a=body_a, body_lines_b=body_b,
                                body_line_numbers_a=nums_a, body_line_numbers_b=nums_b,
-                               per_page_lines=per_page, per_page_line_numbers=per_page_nums)
+                               per_page_lines=per_page, per_page_line_numbers=per_page_nums,
+                               per_page_txn_comparisons=per_page_txn)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
@@ -1301,7 +1570,8 @@ def run_folder_comparison(folder_a: Path,
                            include_diff: bool = True,
                            ignore_dates: bool = False,
                            ignore_line_patterns: Optional[List[str]] = None,
-                           split_rules: Optional[List[SplitRule]] = None) -> None:
+                           split_rules: Optional[List[SplitRule]] = None,
+                           transactions: bool = False) -> None:
     """
     Top-level folder comparison.  Scans both folders, matches files,
     runs per-file comparisons, writes individual reports, and writes
@@ -1331,16 +1601,16 @@ def run_folder_comparison(folder_a: Path,
 
     for pa, pb in match.exact_pairs:
         print(f"  Comparing [exact ] {pa.name}", file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
+        outcome = compare_folder_pair(pa, pb, "exact", 1.0, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
 
     for pa, pb, ratio in match.fuzzy_pairs:
         print(f"  Comparing [fuzzy ] {pa.name} ↔ {pb.name}  (name similarity {ratio:.0%})",
               file=sys.stderr)
-        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules)
+        outcome = compare_folder_pair(pa, pb, "fuzzy", ratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
         outcomes.append(outcome)
-        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules)
+        _write_pair_report(outcome, output_dir, include_diff, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
 
     # ---- Master summary ----
     summary_text = _format_folder_summary(
@@ -1360,7 +1630,8 @@ def _write_pair_report(outcome: FilePairOutcome,
                        include_diff: bool,
                        ignore_dates: bool = False,
                        ignore_line_patterns: Optional[List[str]] = None,
-                       split_rules: Optional[List[SplitRule]] = None) -> None:
+                       split_rules: Optional[List[SplitRule]] = None,
+                       transactions: bool = False) -> None:
     """Write a single pair's comparison report to output_dir (or stdout)."""
     if outcome.error:
         text = (f"ERROR comparing {outcome.file_a.name} ↔ {outcome.file_b.name}\n"
@@ -1370,7 +1641,9 @@ def _write_pair_report(outcome: FilePairOutcome,
         # Re-parse to get full objects for the formatter
         ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
         rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
-        text = format_report(outcome.result, ra, rb, include_diff=include_diff)
+        txn_comps = outcome.per_page_txn_comparisons if transactions else None
+        text = format_report(outcome.result, ra, rb, include_diff=include_diff,
+                             txn_comparisons_per_page=txn_comps)
 
     if output_dir:
         # Use file_a's stem as base; append _vs_<file_b_stem> for fuzzy pairs
@@ -1546,8 +1819,11 @@ def main():
     parser.add_argument("--ignore-lines", action="append", default=[], metavar="PATTERN",
                         help="Skip lines matching this regex (can be repeated: --ignore-lines PAT1 --ignore-lines PAT2)")
     parser.add_argument("--split-config", metavar="CSV",
-                        help="CSV with report_pattern,split_pattern columns; "
+                        help="CSV with report_pattern,split_pattern[,sort_pattern] columns; "
                              "matched files use value-change page splitting instead of delimiter patterns")
+    parser.add_argument("--transactions", action="store_true",
+                        help="Enable transaction-level comparison within pages; "
+                             "transactions are identified by date/time anchors or sort_pattern in --split-config")
 
     # ---- single-file options ----
     parser.add_argument("--output", "-o",
@@ -1586,11 +1862,13 @@ def main():
             ignore_dates=args.ignore_dates,
             ignore_line_patterns=args.ignore_lines or None,
             split_rules=split_rules,
+            transactions=args.transactions,
         )
 
     # ------------------------------------------------------------------ FILE
     elif path_a.is_file() and path_b.is_file():
         split_pat = find_split_pattern(str(path_a), split_rules)
+        sort_re   = find_sort_pattern(str(path_a), split_rules)
         print(f"Parsing  : {path_a}", file=sys.stderr)
         report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
         print(f"Parsing  : {path_b}", file=sys.stderr)
@@ -1599,8 +1877,24 @@ def main():
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
 
+        txn_comps_per_page: Optional[List[List[Dict]]] = None
+        if args.transactions:
+            n_matched = min(len(report_a.pages), len(report_b.pages))
+            txn_comps_per_page = []
+            for i in range(n_matched):
+                pla = [l for l in report_a.pages[i].body_lines if l.strip()]
+                plb = [l for l in report_b.pages[i].body_lines if l.strip()]
+                pna = report_a.pages[i].body_line_numbers
+                pnb = report_b.pages[i].body_line_numbers
+                txns_a = identify_transactions(pla, pna, sort_re)
+                txns_b = identify_transactions(plb, pnb, sort_re)
+                txn_comps_per_page.append(
+                    compare_transactions(txns_a, txns_b) if (txns_a or txns_b) else []
+                )
+
         output = format_report(result, report_a, report_b,
-                                include_diff=not args.no_diff)
+                                include_diff=not args.no_diff,
+                                txn_comparisons_per_page=txn_comps_per_page)
 
         if args.output:
             Path(args.output).write_text(output, encoding="utf-8")
