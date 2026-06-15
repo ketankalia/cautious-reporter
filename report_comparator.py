@@ -1220,7 +1220,7 @@ def format_report(result: ComparisonResult,
                   report_a: ParsedReport,
                   report_b: ParsedReport,
                   include_diff: bool = True,
-                  txn_comparisons_per_page: Optional[List[List[Dict]]] = None) -> str:
+                  txn_comparisons: Optional[List[Dict]] = None) -> str:
     lines = []
 
     def h(title: str, char: str = "="):
@@ -1313,11 +1313,35 @@ def format_report(result: ComparisonResult,
         else:
             lines.append(f"  [REMOVED ] {sec['title_a']}  ({sec['lines']} lines)")
 
+    # Transaction comparison (file-level, whole body)
+    if txn_comparisons is not None:
+        h("TRANSACTION COMPARISON", "-")
+        if txn_comparisons:
+            n_m = sum(1 for t in txn_comparisons if t["status"] == "matched")
+            n_a = sum(1 for t in txn_comparisons if t["status"] == "added")
+            n_r = sum(1 for t in txn_comparisons if t["status"] == "removed")
+            lines.append(f"  Transactions: {n_m} matched, {n_a} added, {n_r} removed")
+            lines.append("")
+            for tc in txn_comparisons:
+                key = tc["sort_key"] or "(no key)"
+                if tc["status"] == "matched":
+                    r2 = tc["diff"]["similarity_ratio"]
+                    flag = f"  similarity: {r2:.1%}" if r2 < 1.0 else "  identical"
+                    chg = (f"  +{tc['diff']['lines_added']}/-{tc['diff']['lines_deleted']}"
+                           if r2 < 1.0 else "")
+                    lines.append(f"  [MATCHED ] {key}{flag}{chg}")
+                elif tc["status"] == "added":
+                    lines.append(f"  [ADDED   ] {key}")
+                else:
+                    lines.append(f"  [REMOVED ] {key}")
+        else:
+            lines.append("  (no transactions detected)")
+
     # Diff section: per-page when available, otherwise whole-body
     if include_diff:
         if result.page_comparisons:
             h("PER-PAGE DIFF", "-")
-            for pg_idx, pc in enumerate(result.page_comparisons):
+            for pc in result.page_comparisons:
                 if pc["status"] == "matched":
                     lines.append("")
                     lines.append(f"  {'─' * 56}")
@@ -1328,44 +1352,10 @@ def format_report(result: ComparisonResult,
                         f"Change: {d['change_pct']:.1f}%   "
                         f"+{d['lines_added']} / -{d['lines_deleted']} lines"
                     )
-
-                    # Transaction mode: show per-transaction summary when available
-                    txn_comps = (
-                        txn_comparisons_per_page[pg_idx]
-                        if txn_comparisons_per_page and pg_idx < len(txn_comparisons_per_page)
-                        else None
-                    )
-                    if txn_comparisons_per_page is not None:
-                        if txn_comps:
-                            n_m = sum(1 for t in txn_comps if t["status"] == "matched")
-                            n_a = sum(1 for t in txn_comps if t["status"] == "added")
-                            n_r = sum(1 for t in txn_comps if t["status"] == "removed")
-                            lines.append(f"  Transactions: {n_m} matched, {n_a} added, {n_r} removed")
-                            for tc in txn_comps:
-                                key = tc["sort_key"] or "(no key)"
-                                if tc["status"] == "matched":
-                                    r2 = tc["diff"]["similarity_ratio"]
-                                    flag = (f"  similarity: {r2:.1%}"
-                                            if r2 < 1.0 else "  identical")
-                                    chg = (f"  +{tc['diff']['lines_added']}/"
-                                           f"-{tc['diff']['lines_deleted']}"
-                                           if r2 < 1.0 else "")
-                                    lines.append(f"    [MATCHED ] {key}{flag}{chg}")
-                                elif tc["status"] == "added":
-                                    lines.append(f"    [ADDED   ] {key}")
-                                else:
-                                    lines.append(f"    [REMOVED ] {key}")
-                        else:
-                            lines.append("  (no transactions detected — line diff shown)")
-                            if pc["diff_text"].strip():
-                                lines.append(pc["diff_text"])
-                            else:
-                                lines.append("  (identical)")
+                    if pc["diff_text"].strip():
+                        lines.append(pc["diff_text"])
                     else:
-                        if pc["diff_text"].strip():
-                            lines.append(pc["diff_text"])
-                        else:
-                            lines.append("  (identical)")
+                        lines.append("  (identical)")
                 elif pc["status"] == "added":
                     lines.append("")
                     lines.append(f"  [ADDED  ] Page {pc['page_num_b']} (only in B, {pc['lines']} lines)")
@@ -1503,8 +1493,8 @@ class FilePairOutcome:
     body_line_numbers_b: List[int] = field(default_factory=list)
     per_page_lines: List[Tuple[List[str], List[str]]] = field(default_factory=list)
     per_page_line_numbers: List[Tuple[List[int], List[int]]] = field(default_factory=list)
-    # per-page transaction comparisons; empty list = no transactions detected on that page
-    per_page_txn_comparisons: List[List[Dict]] = field(default_factory=list)
+    # file-level transaction comparisons (whole body, not per-page)
+    file_txn_comparisons: List[Dict] = field(default_factory=list)
 
 
 def compare_folder_pair(path_a: Path,
@@ -1536,25 +1526,21 @@ def compare_folder_pair(path_a: Path,
             per_page.append((pla, plb))
             per_page_nums.append((pna, pnb))
 
-        per_page_txn: List[List[Dict]] = []
+        file_txn: List[Dict] = []
         if transactions:
             sort_re = find_sort_pattern(str(path_a), split_rules)
-            for i in range(n_matched):
-                pla, plb = per_page[i]
-                pna, pnb = per_page_nums[i]
-                txns_a = identify_transactions(pla, pna, sort_re)
-                txns_b = identify_transactions(plb, pnb, sort_re)
+            if sort_re is not None:
+                txns_a = identify_transactions(body_a, nums_a, sort_re)
+                txns_b = identify_transactions(body_b, nums_b, sort_re)
                 if txns_a or txns_b:
-                    per_page_txn.append(compare_transactions(txns_a, txns_b))
-                else:
-                    per_page_txn.append([])  # no transactions detected → line-diff fallback
+                    file_txn = compare_transactions(txns_a, txns_b)
 
         result = compare_reports(ra, rb, use_semantic=use_semantic)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
                                body_lines_a=body_a, body_lines_b=body_b,
                                body_line_numbers_a=nums_a, body_line_numbers_b=nums_b,
                                per_page_lines=per_page, per_page_line_numbers=per_page_nums,
-                               per_page_txn_comparisons=per_page_txn)
+                               file_txn_comparisons=file_txn)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
@@ -1641,9 +1627,9 @@ def _write_pair_report(outcome: FilePairOutcome,
         # Re-parse to get full objects for the formatter
         ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
         rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
-        txn_comps = outcome.per_page_txn_comparisons if transactions else None
+        txn_comps = outcome.file_txn_comparisons if transactions else None
         text = format_report(outcome.result, ra, rb, include_diff=include_diff,
-                             txn_comparisons_per_page=txn_comps)
+                             txn_comparisons=txn_comps)
 
     if output_dir:
         # Use file_a's stem as base; append _vs_<file_b_stem> for fuzzy pairs
@@ -1877,24 +1863,17 @@ def main():
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
 
-        txn_comps_per_page: Optional[List[List[Dict]]] = None
-        if args.transactions:
-            n_matched = min(len(report_a.pages), len(report_b.pages))
-            txn_comps_per_page = []
-            for i in range(n_matched):
-                pla = [l for l in report_a.pages[i].body_lines if l.strip()]
-                plb = [l for l in report_b.pages[i].body_lines if l.strip()]
-                pna = report_a.pages[i].body_line_numbers
-                pnb = report_b.pages[i].body_line_numbers
-                txns_a = identify_transactions(pla, pna, sort_re)
-                txns_b = identify_transactions(plb, pnb, sort_re)
-                txn_comps_per_page.append(
-                    compare_transactions(txns_a, txns_b) if (txns_a or txns_b) else []
-                )
+        txn_comps: Optional[List[Dict]] = None
+        if args.transactions and sort_re is not None:
+            body_a = [l for l in report_a.body_lines if l.strip()]
+            body_b = [l for l in report_b.body_lines if l.strip()]
+            txns_a = identify_transactions(body_a, report_a.body_line_numbers, sort_re)
+            txns_b = identify_transactions(body_b, report_b.body_line_numbers, sort_re)
+            txn_comps = compare_transactions(txns_a, txns_b) if (txns_a or txns_b) else []
 
         output = format_report(result, report_a, report_b,
                                 include_diff=not args.no_diff,
-                                txn_comparisons_per_page=txn_comps_per_page)
+                                txn_comparisons=txn_comps)
 
         if args.output:
             Path(args.output).write_text(output, encoding="utf-8")
