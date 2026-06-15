@@ -46,6 +46,7 @@ from report_comparator import (
     FolderMatchResult, FilePairOutcome,
     diff_opcodes,
     load_split_config, SplitRule,
+    write_txn_csv,
 )
 
 BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
@@ -1236,8 +1237,14 @@ def run(folder_a: Path, folder_b: Path,
         body_b = outcome.body_lines_b
         per_page_lines = outcome.per_page_lines
 
-        # Generate .bat launcher
         stem = pa.stem if mtype == "exact" else f"{pa.stem}_vs_{pb.stem}"
+
+        if outcome.file_txn_comparisons:
+            csv_path = output.parent / f"{stem}_txn.csv"
+            write_txn_csv(outcome.file_txn_comparisons, csv_path)
+            print(f"  TXN CSV → {csv_path}", file=sys.stderr)
+
+        # Generate .bat launcher
         bat_path = output.parent / f"open_bcompare_{stem}.bat"
         bat_url = write_bcompare_bat(pa, pb, bat_path, bcompare_exe,
                                       linux_base, windows_base)
