@@ -935,6 +935,15 @@ def _sort_key_comparable(val: object) -> tuple:
     return (2, str(val))
 
 
+def _is_dash_separator(line: str, threshold: float = 0.5) -> bool:
+    """True when most non-whitespace characters in the line are dashes (e.g. '---...---' rule lines)."""
+    s = line.strip()
+    if not s:
+        return False
+    dash_chars = sum(1 for c in s if c in '-–—')
+    return dash_chars / len(s) >= threshold
+
+
 def identify_transactions(
     lines: List[str],
     line_numbers: List[int],
@@ -1109,6 +1118,45 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
                 w.writerow([key, status, 0, len(tc["txn_b"].lines), 0])
             else:
                 w.writerow([key, status, 0, 0, len(tc["txn_a"].lines)])
+
+
+def extract_txn_csv_for_file(path: Path,
+                             split_rules: Optional[List[SplitRule]],
+                             ignore_dates: bool,
+                             ignore_line_patterns: Optional[List[str]],
+                             out_dir: Path,
+                             prefix: str = "") -> Optional[Path]:
+    """Extract every transaction in *path* to a standalone CSV (--extract-txn).
+
+    Only runs when a --split-config rule matching *path* defines sort_pattern;
+    returns None otherwise (or when no transactions are found). Rows are
+    ordered by sort key, one row per raw line: (sort_key, line).
+    """
+    sort_re = find_sort_pattern(str(path), split_rules)
+    if sort_re is None:
+        return None
+
+    split_pat  = find_split_pattern(str(path), split_rules)
+    max_txn_ln = find_max_txn_lines(str(path), split_rules)
+    report = parse_report(str(path), ignore_dates=ignore_dates,
+                          ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
+    pairs = [(l, n) for l, n in zip(report.body_lines, report.body_line_numbers) if l.strip()]
+    body = [l for l, _ in pairs]
+    nums = [n for _, n in pairs]
+
+    txns = identify_transactions(body, nums, sort_re, max_txn_ln)
+    if not txns:
+        return None
+    txns.sort(key=lambda t: _sort_key_comparable(t.sort_val))
+
+    stem = f"{prefix}_{path.stem}" if prefix else path.stem
+    out_path = out_dir / f"{stem}_txn_extract.csv"
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        for t in txns:
+            for line in t.lines:
+                w.writerow([t.sort_key, line])
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -1593,7 +1641,8 @@ def run_folder_comparison(folder_a: Path,
                            ignore_dates: bool = False,
                            ignore_line_patterns: Optional[List[str]] = None,
                            split_rules: Optional[List[SplitRule]] = None,
-                           transactions: bool = False) -> None:
+                           transactions: bool = False,
+                           extract_txn: bool = False) -> None:
     """
     Top-level folder comparison.  Scans both folders, matches files,
     runs per-file comparisons, writes individual reports, and writes
@@ -1617,6 +1666,27 @@ def run_folder_comparison(folder_a: Path,
 
     if output_dir:
         output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- Extract transactions (--extract-txn, independent of comparison) ----
+    if extract_txn:
+        if not output_dir:
+            print("  --extract-txn requires --output-dir (no destination for extracted CSVs)",
+                  file=sys.stderr)
+        elif not split_rules:
+            print("  --extract-txn requires --split-config (no sort_pattern rules loaded)",
+                  file=sys.stderr)
+        else:
+            print("  Extracting transactions (--extract-txn)...", file=sys.stderr)
+            for p in list(files_a.values()):
+                out = extract_txn_csv_for_file(p, split_rules, ignore_dates, ignore_line_patterns,
+                                               output_dir, prefix="A")
+                if out:
+                    print(f"    TXN EXTRACT → {out}", file=sys.stderr)
+            for p in list(files_b.values()):
+                out = extract_txn_csv_for_file(p, split_rules, ignore_dates, ignore_line_patterns,
+                                               output_dir, prefix="B")
+                if out:
+                    print(f"    TXN EXTRACT → {out}", file=sys.stderr)
 
     # ---- Run comparisons ----
     outcomes: List[FilePairOutcome] = []
@@ -1850,6 +1920,12 @@ def main():
     parser.add_argument("--transactions", action="store_true",
                         help="Enable transaction-level comparison within pages; "
                              "transactions are identified by date/time anchors or sort_pattern in --split-config")
+    parser.add_argument("--extract-txn", action="store_true",
+                        help="Extract every transaction from each file whose --split-config rule "
+                             "defines sort_pattern into <file>_txn_extract.csv (one CSV per file, "
+                             "sorted by sort key, one row per line: sort_key, line). "
+                             "Independent of --transactions; requires --split-config and an output "
+                             "destination (--output-dir in folder mode, --output in file mode).")
 
     # ---- single-file options ----
     parser.add_argument("--output", "-o",
@@ -1889,6 +1965,7 @@ def main():
             ignore_line_patterns=args.ignore_lines or None,
             split_rules=split_rules,
             transactions=args.transactions,
+            extract_txn=args.extract_txn,
         )
 
     # ------------------------------------------------------------------ FILE
@@ -1924,8 +2001,17 @@ def main():
                 csv_path = out_p.parent / f"{out_p.stem}_txn.csv"
                 write_txn_csv(txn_comps, csv_path)
                 print(f"TXN CSV  → {csv_path}", file=sys.stderr)
+            if args.extract_txn and split_rules:
+                for p, prefix in ((path_a, "A"), (path_b, "B")):
+                    extracted = extract_txn_csv_for_file(
+                        p, split_rules, args.ignore_dates, args.ignore_lines or None,
+                        out_p.parent, prefix=prefix)
+                    if extracted:
+                        print(f"TXN EXTRACT → {extracted}", file=sys.stderr)
         else:
             print(output)
+            if args.extract_txn:
+                print("--extract-txn requires --output in file mode", file=sys.stderr)
 
     # ------------------------------------------------------------------ ERROR
     else:
