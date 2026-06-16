@@ -556,7 +556,7 @@ def pair_card(outcome: FilePairOutcome,
                            line_nums_a=outcome.body_line_numbers_a or None,
                            line_nums_b=outcome.body_line_numbers_b or None)
         diff_panel = (
-            f'<div class="diff-wrap" id="{diff_id}" data-diff-src="{diff_id}-data">'
+            f'<div class="diff-outer" id="{diff_id}">'
             f'<div class="diff-toolbar">'
             f'  <span>Inline diff — body content (headers &amp; footers excluded)</span>'
             f'  <span class="diff-legend">'
@@ -565,6 +565,7 @@ def pair_card(outcome: FilePairOutcome,
             f'    <span class="dl-ins">+ added</span>'
             f'  </span>'
             f'</div>'
+            f'<div class="diff-wrap" data-diff-src="{diff_id}-data"></div>'
             f'</div>'
             + _diff_tag(diff_id, _rows)
         )
@@ -737,7 +738,8 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 
 /* Cards */
 .card{background:var(--card);border:1px solid var(--border);border-radius:10px;
-      margin-bottom:16px;overflow:hidden;border-left:4px solid var(--border)}
+      margin-bottom:16px;overflow:hidden;border-left:4px solid var(--border);
+      content-visibility:auto;contain-intrinsic-size:0 120px}
 .card.identical{border-left-color:var(--identical)}
 .card.minor{border-left-color:var(--minor)}
 .card.moderate{border-left-color:var(--moderate)}
@@ -833,19 +835,20 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .no-results{text-align:center;color:var(--muted);padding:40px;font-size:14px}
 
 /* Diff panel */
-.diff-wrap{display:none;border-top:1px solid var(--border);overflow-x:auto;overflow-y:auto;max-height:min(600px,calc(100vh - 120px))}
-.diff-wrap.open{display:block}
+.diff-outer{display:none;border-top:1px solid var(--border)}
+.diff-outer.open{display:block}
+.diff-wrap{overflow-x:auto;overflow-y:auto;max-height:min(600px,calc(100vh - 120px))}
 .diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
 .diff-toolbar{display:flex;justify-content:space-between;align-items:center;
               padding:6px 14px;background:#f9fafb;border-bottom:1px solid var(--border);
-              font-size:12px;color:var(--muted);flex-wrap:wrap;gap:8px;position:sticky;top:0;z-index:1}
-.diff-legend{display:flex;gap:12px}
+              font-size:12px;color:var(--muted);flex-wrap:wrap;gap:8px}
+.diff-legend{display:flex;flex-wrap:wrap;gap:4px 12px}
 .dl-del{color:#991b1b;font-weight:600}
 .dl-ins{color:#166534;font-weight:600}
 .dl-chg{color:#92400e;font-weight:600}
 .diff-table{width:100%;border-collapse:collapse;font-family:'Cascadia Code','Consolas',monospace;font-size:12px;line-height:1.6}
 .diff-table thead th{padding:3px 8px;background:#f1f5f9;border-bottom:2px solid var(--border);
-                     color:var(--muted);font-size:11px;font-weight:600;position:sticky;top:33px}
+                     color:var(--muted);font-size:11px;font-weight:600;position:sticky;top:0}
 .diff-table .ln{width:44px;text-align:right;color:#9ca3af;background:#f8fafc;
                 border-right:1px solid var(--border);padding:1px 6px;
                 font-size:11px;user-select:none;white-space:nowrap}
@@ -927,48 +930,68 @@ function applyDiffWindow(state,scrollTop){
 }
 async function renderDiff(el){
   if(el.dataset.rendered)return;
-  const script=document.getElementById(el.dataset.diffSrc);
-  if(!script)return;
-  let json;
-  try{
-    if(script.dataset.enc==='gz'){
-      const bin=atob(script.textContent.trim());
-      const bytes=new Uint8Array(bin.length);
-      for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
-      const ds=new DecompressionStream('gzip');
-      const w=ds.writable.getWriter();
-      w.write(bytes);w.close();
-      json=new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
-    }else{
-      json=script.textContent;
+  let rows=el._diffRows;
+  if(!rows){
+    const script=document.getElementById(el.dataset.diffSrc);
+    if(!script)return;
+    try{
+      let json;
+      if(script.dataset.enc==='gz'){
+        const bin=atob(script.textContent.trim());
+        const bytes=new Uint8Array(bin.length);
+        for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+        const ds=new DecompressionStream('gzip');
+        const w=ds.writable.getWriter();
+        w.write(bytes);w.close();
+        json=new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+      }else{
+        json=script.textContent;
+      }
+      rows=JSON.parse(json);
+      el._diffRows=rows;
+      script.remove();
+    }catch(e){
+      el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
+      el.dataset.rendered='1';
+      return;
     }
-    const rows=JSON.parse(json);
-    const tbody=document.createElement('tbody');
-    const top=makeSpacerRow(),bot=makeSpacerRow();
-    const state={rows,tbody,top,bot,el};
-    applyDiffWindow(state,0);
-    const tbl=document.createElement('table');
-    tbl.className='diff-table';
-    tbl.innerHTML='<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>'
-      +'<thead><tr><th class="ln">A</th><th class="ln">B</th><th>Content</th></tr></thead>';
-    tbl.appendChild(tbody);
-    el.appendChild(tbl);
-    // Clamp height so the panel + scrollbar stay within the viewport
-    const rect=el.getBoundingClientRect();
-    const spare=window.innerHeight-rect.top-40;
-    if(spare>80&&spare<el.clientHeight)el.style.maxHeight=spare+'px';
-    el.addEventListener('scroll',()=>applyDiffWindow(state,el.scrollTop));
-  }catch(e){
-    el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
   }
+  const tbody=document.createElement('tbody');
+  const top=makeSpacerRow(),bot=makeSpacerRow();
+  const state={rows,tbody,top,bot,el};
+  applyDiffWindow(state,0);
+  const tbl=document.createElement('table');
+  tbl.className='diff-table';
+  tbl.innerHTML='<colgroup><col style="width:44px"><col style="width:44px"><col></colgroup>'
+    +'<thead><tr><th class="ln">A</th><th class="ln">B</th><th>Content</th></tr></thead>';
+  tbl.appendChild(tbody);
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.appendChild(tbl);
+  el.appendChild(wrap);
+  const rect=el.getBoundingClientRect();
+  const spare=window.innerHeight-rect.top-40;
+  if(spare>80&&spare<el.clientHeight)el.style.maxHeight=spare+'px';
+  const ac=new AbortController();
+  el._diffAbort=ac;
+  let _raf=0;
+  el.addEventListener('scroll',()=>{
+    cancelAnimationFrame(_raf);
+    _raf=requestAnimationFrame(()=>applyDiffWindow(state,el.scrollTop));
+  },{signal:ac.signal});
   el.dataset.rendered='1';
 }
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function renderTxnPanel(el,txnSrcId){
   if(el.dataset.rendered)return;
-  const script=document.getElementById(txnSrcId);
-  if(!script)return;
-  const d=JSON.parse(script.textContent);
+  let d=el._txnData;
+  if(!d){
+    const script=document.getElementById(txnSrcId);
+    if(!script)return;
+    d=JSON.parse(script.textContent);
+    el._txnData=d;
+    script.remove();
+  }
   const s=d.summary;
   let hdr=`<div class="txn-summary">Transactions: <strong>${s.matched}</strong> matched`;
   if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
@@ -984,21 +1007,29 @@ function renderTxnPanel(el,txnSrcId){
       const chg=`+${add} −${ndel}`;
       const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
       tb+=`<tr class="${css}"><td class="mono">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
-      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Txn: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
+      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Txn: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
     }else if(t[0]===1){
       tb+=`<tr class="s-added"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
     }else{
       tb+=`<tr class="s-removed"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
     }
   }
-  el.insertAdjacentHTML('beforeend',hdr+`<table class="sec-table txn-table"><thead><tr><th>Sort Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`);
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Sort Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
+  el.appendChild(wrap);
   el.dataset.rendered='1';
 }
 function renderPages(el){
   if(el.dataset.rendered)return;
-  const script=document.getElementById(el.dataset.pagesSrc);
-  if(!script)return;
-  const d=JSON.parse(script.textContent);
+  let d=el._pagesData;
+  if(!d){
+    const script=document.getElementById(el.dataset.pagesSrc);
+    if(!script)return;
+    d=JSON.parse(script.textContent);
+    el._pagesData=d;
+    script.remove();
+  }
   const SM=[['s-identical','Identical'],['s-minor','Minor'],['s-moderate','Moderate'],['s-significant','Changed'],['s-added','Added'],['s-removed','Removed']];
   const pid=el.id;
   const total=Object.values(d.counts).reduce((a,b)=>a+b,0);
@@ -1015,7 +1046,7 @@ function renderPages(el){
       const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
       const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
       tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td></tr>`;
-      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-wrap open" data-diff-src="${did}-data"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div></div></td></tr>`;
+      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
     }else if(pg[0]===1){
       const[,pnb,lines]=pg;
       tb+=`<tr class="s-added"><td>Page ${pnb}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
@@ -1024,13 +1055,27 @@ function renderPages(el){
       tb+=`<tr class="s-removed"><td>Page ${pna}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
     }
   }
-  el.insertAdjacentHTML('afterbegin',`<div class="pg-filter-bar">${fb}</div><table class="sec-table"><thead><tr><th>Page</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`);
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.innerHTML=`<div class="pg-filter-bar">${fb}</div><table class="sec-table"><thead><tr><th>Page</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
+  el.appendChild(wrap);
   el.dataset.rendered='1';
+}
+function clearPanel(el){
+  // Abort scroll listeners on any diff panels (self + nested)
+  [el,...Array.from(el.querySelectorAll('[data-diff-src]'))].forEach(dw=>{
+    if(dw._diffAbort){dw._diffAbort.abort();delete dw._diffAbort;}
+    if(dw.dataset.diffSrc){dw.style.maxHeight='';delete dw.dataset.rendered;}
+  });
+  el.querySelectorAll('.panel-content').forEach(c=>c.remove());
+  delete el.dataset.rendered;
 }
 async function toggle(btn,id){
   const el=document.getElementById(id);
   const wasOpen=el.classList.contains('open');
-  if(!wasOpen){
+  if(wasOpen){
+    clearPanel(el);
+  }else{
     if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
     else if(el.dataset.txnSrc&&!el.dataset.rendered)renderTxnPanel(el,el.dataset.txnSrc);
     else{
@@ -1085,8 +1130,7 @@ def build_html(folder_a: Path, folder_b: Path,
                outcomes: List[FilePairOutcome],
                cards_html: str,
                unmatched_html: str,
-               ext: str,
-               bcompare_exe: str) -> str:
+               ext: str) -> str:
 
     total = len(outcomes)
     ok    = [o for o in outcomes if not o.error]
@@ -1259,7 +1303,7 @@ def run(folder_a: Path, folder_b: Path,
                                         linux_base, windows_base)
 
     html = build_html(folder_a, folder_b, match, outcomes,
-                       cards_html, unmatched_html, ext, bcompare_exe)
+                       cards_html, unmatched_html, ext)
 
     output.write_text(html, encoding="utf-8")
     print(f"\nHTML report → {output}", file=sys.stderr)
