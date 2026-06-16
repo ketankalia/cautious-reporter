@@ -46,7 +46,7 @@ from report_comparator import (
     FolderMatchResult, FilePairOutcome,
     diff_opcodes,
     load_split_config, SplitRule,
-    write_txn_csv,
+    write_txn_csv, extract_txn_csv_for_file,
 )
 
 BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
@@ -839,9 +839,10 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .diff-outer.open{display:block}
 .diff-wrap{overflow-x:auto;overflow-y:auto;max-height:min(600px,calc(100vh - 120px))}
 .diff-row{display:none}.diff-row.open{display:table-row}.diff-row td{padding:0;border-top:none}
-.diff-toolbar{display:flex;justify-content:space-between;align-items:center;
+.diff-toolbar{display:flex;align-items:center;
               padding:6px 14px;background:#f9fafb;border-bottom:1px solid var(--border);
               font-size:12px;color:var(--muted);flex-wrap:wrap;gap:8px}
+.diff-toolbar>span:first-child{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .diff-legend{display:flex;flex-wrap:wrap;gap:4px 12px}
 .dl-del{color:#991b1b;font-weight:600}
 .dl-ins{color:#166534;font-weight:600}
@@ -1245,7 +1246,8 @@ def run(folder_a: Path, folder_b: Path,
         ignore_dates: bool = False,
         ignore_line_patterns: Optional[List[str]] = None,
         split_rules: Optional[List[SplitRule]] = None,
-        transactions: bool = False) -> None:
+        transactions: bool = False,
+        extract_txn: bool = False) -> None:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1254,6 +1256,23 @@ def run(folder_a: Path, folder_b: Path,
     print(f"Scanning  : {folder_b}", file=sys.stderr)
     files_b = scan_folder(folder_b, ext)
     print(f"  A={len(files_a)} files   B={len(files_b)} files", file=sys.stderr)
+
+    if extract_txn:
+        if not split_rules:
+            print("  --extract-txn requires --split-config (no sort_pattern rules loaded)",
+                  file=sys.stderr)
+        else:
+            print("  Extracting transactions (--extract-txn)...", file=sys.stderr)
+            for p in list(files_a.values()):
+                out = extract_txn_csv_for_file(p, split_rules, ignore_dates, ignore_line_patterns,
+                                               output.parent, prefix="A")
+                if out:
+                    print(f"    TXN EXTRACT → {out}", file=sys.stderr)
+            for p in list(files_b.values()):
+                out = extract_txn_csv_for_file(p, split_rules, ignore_dates, ignore_line_patterns,
+                                               output.parent, prefix="B")
+                if out:
+                    print(f"    TXN EXTRACT → {out}", file=sys.stderr)
 
     match = match_filenames(files_a, files_b, fuzzy=fuzzy,
                              fuzzy_threshold=fuzzy_threshold)
@@ -1347,6 +1366,11 @@ def main():
     p.add_argument("--transactions", action="store_true",
                    help="Enable transaction-level comparison within pages; "
                         "transactions identified by date/time anchors or sort_pattern in --split-config")
+    p.add_argument("--extract-txn", action="store_true",
+                   help="Extract every transaction from each file in both folders whose --split-config "
+                        "rule defines sort_pattern into <file>_txn_extract.csv next to the HTML report "
+                        "(one CSV per file, sorted by sort key, one row per line: sort_key, line). "
+                        "Independent of --transactions; requires --split-config.")
 
     args = p.parse_args()
 
@@ -1365,6 +1389,7 @@ def main():
         ignore_line_patterns  = args.ignore_lines or None,
         split_rules           = load_split_config(args.split_config) if args.split_config else None,
         transactions          = args.transactions,
+        extract_txn           = args.extract_txn,
     )
 
 
