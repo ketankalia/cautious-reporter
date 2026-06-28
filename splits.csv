@@ -1,0 +1,3 @@
+report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
+invoices.*,^INVOICE NO:\s+(\S+),^DATE:\s+(.+),,
+TERM.*,PAGE\s+(\d+),FOO[A-Z0-9]+\s(\d+),3,"^[-]{20,}\s*$"
