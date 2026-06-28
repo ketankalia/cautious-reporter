@@ -119,20 +119,23 @@ class SplitRule:
     split_re: re.Pattern
     sort_re: Optional[re.Pattern] = None
     max_txn_lines: Optional[int] = None
+    separator_re: Optional[re.Pattern] = None
 
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
-    """Load report_pattern,split_pattern[,sort_pattern[,max_txn_lines]] CSV into SplitRule list."""
+    """Load report_pattern,split_pattern[,sort_pattern[,max_txn_lines[,separator_pattern]]] CSV into SplitRule list."""
     rules: List[SplitRule] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             sort_pat = row.get("sort_pattern", "").strip()
             mtl_raw  = row.get("max_txn_lines", "").strip()
+            sep_pat  = row.get("separator_pattern", "").strip()
             rules.append(SplitRule(
                 report_re=re.compile(row["report_pattern"]),
                 split_re=re.compile(row["split_pattern"]),
                 sort_re=re.compile(sort_pat) if sort_pat else None,
                 max_txn_lines=int(mtl_raw) if mtl_raw else None,
+                separator_re=re.compile(sep_pat) if sep_pat else None,
             ))
     return rules
 
@@ -170,6 +173,18 @@ def find_max_txn_lines(filename: str,
     for rule in rules:
         if rule.report_re.search(name):
             return rule.max_txn_lines
+    return None
+
+
+def find_separator_pattern(filename: str,
+                            rules: Optional[List["SplitRule"]]) -> Optional[re.Pattern]:
+    """Return the separator_re for the first matching rule, else None."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.separator_re
     return None
 
 
@@ -1120,6 +1135,137 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
                 w.writerow([key, status, 0, 0, len(tc["txn_a"].lines)])
 
 
+# ---------------------------------------------------------------------------
+# SUMMARY SECTION EXTRACTION  (lines between separator_re delimiters,
+# after removing transaction-owned lines)
+# ---------------------------------------------------------------------------
+
+_SECTION_HEADER_RE = re.compile(r'^\*{3}')
+
+
+def _normalize_section_name(line: str) -> str:
+    """Strip ***, leading HH:MM:SS, and trailing (date/...) from a *** header line."""
+    s = re.sub(r'^\*+\s*', '', line.strip())
+    s = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', s)
+    s = re.split(r'\s*\(', s)[0].strip()
+    return s
+
+
+def extract_summary_sections(
+    body_lines: List[str],
+    body_nums: List[int],
+    txn_nums: Set[int],
+    separator_re: re.Pattern,
+) -> List[Dict]:
+    """Extract named (***) sections from non-transaction body lines.
+
+    Sections are delimited by lines matching separator_re.  Lines whose
+    original line number is in txn_nums are skipped.  Only blocks whose
+    first non-blank line starts with *** are returned (pre-separator header
+    content is discarded).
+    """
+    sections: List[Dict] = []
+    collecting_lines: List[str] = []
+    collecting_nums: List[int] = []
+
+    def _flush():
+        if not collecting_lines:
+            return
+        first = next((l for l in collecting_lines if l.strip()), "")
+        if _SECTION_HEADER_RE.match(first.lstrip()):
+            sections.append({
+                "name":         first.strip(),
+                "lines":        list(collecting_lines),
+                "line_numbers": list(collecting_nums),
+            })
+
+    for line, num in zip(body_lines, body_nums):
+        if separator_re.match(line):          # separator always defines boundary
+            _flush()
+            collecting_lines = []
+            collecting_nums  = []
+        elif num in txn_nums:
+            continue                          # skip txn-owned non-separator lines
+        else:
+            collecting_lines.append(line)
+            collecting_nums.append(num)
+
+    _flush()
+    return sections
+
+
+def compare_summary_sections(
+    secs_a: List[Dict],
+    secs_b: List[Dict],
+) -> List[Dict]:
+    """Match sections by normalized name (group-index for duplicates) and diff them."""
+    from collections import defaultdict
+
+    groups_a: Dict[str, list] = defaultdict(list)
+    groups_b: Dict[str, list] = defaultdict(list)
+    for s in secs_a:
+        groups_a[_normalize_section_name(s["name"])].append(s)
+    for s in secs_b:
+        groups_b[_normalize_section_name(s["name"])].append(s)
+
+    # preserve encounter order, deduplicate
+    seen: dict = {}
+    for s in secs_a + secs_b:
+        k = _normalize_section_name(s["name"])
+        if k not in seen:
+            seen[k] = None
+    all_keys = list(seen)
+
+    results: List[Dict] = []
+    for key in all_keys:
+        as_ = groups_a.get(key, [])
+        bs_ = groups_b.get(key, [])
+        for i in range(max(len(as_), len(bs_))):
+            if i < len(as_) and i < len(bs_):
+                diff = line_diff_stats(as_[i]["lines"], bs_[i]["lines"])
+                status = "identical" if diff["similarity_ratio"] == 1.0 else "changed"
+                results.append({
+                    "status":  status,
+                    "name":    as_[i]["name"],
+                    "name_b":  bs_[i]["name"],
+                    "lines_a": as_[i]["lines"],
+                    "lines_b": bs_[i]["lines"],
+                    "diff":    diff,
+                })
+            elif i < len(as_):
+                results.append({
+                    "status":  "removed",
+                    "name":    as_[i]["name"],
+                    "lines_a": as_[i]["lines"],
+                })
+            else:
+                results.append({
+                    "status":  "added",
+                    "name":    bs_[i]["name"],
+                    "lines_b": bs_[i]["lines"],
+                })
+    return results
+
+
+def write_section_csv(file_section_comparisons: List[Dict], csv_path: Path) -> None:
+    """Write section comparison results to a CSV file."""
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["section_name", "status", "similarity_pct", "lines_added", "lines_deleted"])
+        for sc in file_section_comparisons:
+            name   = sc["name"]
+            status = sc["status"]
+            if status in ("identical", "changed"):
+                d = sc["diff"]
+                w.writerow([name, status,
+                             round(d["similarity_ratio"] * 100, 1),
+                             d["lines_added"], d["lines_deleted"]])
+            elif status == "added":
+                w.writerow([name, status, 0, len(sc["lines_b"]), 0])
+            else:
+                w.writerow([name, status, 0, 0, len(sc["lines_a"])])
+
+
 def extract_txn_csv_for_file(path: Path,
                              split_rules: Optional[List[SplitRule]],
                              ignore_dates: bool,
@@ -1578,6 +1724,8 @@ class FilePairOutcome:
     per_page_line_numbers: List[Tuple[List[int], List[int]]] = field(default_factory=list)
     # file-level transaction comparisons (whole body, not per-page)
     file_txn_comparisons: List[Dict] = field(default_factory=list)
+    # file-level summary-section comparisons (*** blocks between separator lines)
+    file_section_comparisons: List[Dict] = field(default_factory=list)
 
 
 def compare_folder_pair(path_a: Path,
@@ -1609,6 +1757,8 @@ def compare_folder_pair(path_a: Path,
             per_page.append((pla, plb))
             per_page_nums.append((pna, pnb))
 
+        txns_a: List[Transaction] = []
+        txns_b: List[Transaction] = []
         file_txn: List[Dict] = []
         if transactions:
             sort_re    = find_sort_pattern(str(path_a), split_rules)
@@ -1619,12 +1769,23 @@ def compare_folder_pair(path_a: Path,
                 if txns_a or txns_b:
                     file_txn = compare_transactions(txns_a, txns_b)
 
+        file_sec: List[Dict] = []
+        sep_re = find_separator_pattern(str(path_a), split_rules)
+        if sep_re is not None:
+            txn_nums_a: Set[int] = {n for t in txns_a for n in t.line_numbers}
+            txn_nums_b: Set[int] = {n for t in txns_b for n in t.line_numbers}
+            secs_a = extract_summary_sections(body_a, nums_a, txn_nums_a, sep_re)
+            secs_b = extract_summary_sections(body_b, nums_b, txn_nums_b, sep_re)
+            if secs_a or secs_b:
+                file_sec = compare_summary_sections(secs_a, secs_b)
+
         result = compare_reports(ra, rb, use_semantic=use_semantic)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
                                body_lines_a=body_a, body_lines_b=body_b,
                                body_line_numbers_a=nums_a, body_line_numbers_b=nums_b,
                                per_page_lines=per_page, per_page_line_numbers=per_page_nums,
-                               file_txn_comparisons=file_txn)
+                               file_txn_comparisons=file_txn,
+                               file_section_comparisons=file_sec)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
@@ -1749,6 +1910,10 @@ def _write_pair_report(outcome: FilePairOutcome,
             csv_path = output_dir / f"{stem}_txn.csv"
             write_txn_csv(outcome.file_txn_comparisons, csv_path)
             print(f"    TXN CSV → {csv_path}", file=sys.stderr)
+        if outcome.file_section_comparisons:
+            csv_path = output_dir / f"{stem}_sections.csv"
+            write_section_csv(outcome.file_section_comparisons, csv_path)
+            print(f"    SEC CSV → {csv_path}", file=sys.stderr)
     else:
         print(text)
         print()
@@ -1981,13 +2146,29 @@ def main():
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
 
+        def _fm_filter(lines: List[str], nums: List[int]):
+            pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
+            return [l for l, _ in pairs], [n for _, n in pairs]
+
+        body_a, nums_a = _fm_filter(report_a.body_lines, report_a.body_line_numbers)
+        body_b, nums_b = _fm_filter(report_b.body_lines, report_b.body_line_numbers)
+
+        _fm_txns_a: List[Transaction] = []
+        _fm_txns_b: List[Transaction] = []
         txn_comps: Optional[List[Dict]] = None
         if args.transactions and sort_re is not None:
-            body_a = [l for l in report_a.body_lines if l.strip()]
-            body_b = [l for l in report_b.body_lines if l.strip()]
-            txns_a = identify_transactions(body_a, report_a.body_line_numbers, sort_re, max_txn_ln)
-            txns_b = identify_transactions(body_b, report_b.body_line_numbers, sort_re, max_txn_ln)
-            txn_comps = compare_transactions(txns_a, txns_b) if (txns_a or txns_b) else []
+            _fm_txns_a = identify_transactions(body_a, nums_a, sort_re, max_txn_ln)
+            _fm_txns_b = identify_transactions(body_b, nums_b, sort_re, max_txn_ln)
+            txn_comps = compare_transactions(_fm_txns_a, _fm_txns_b) if (_fm_txns_a or _fm_txns_b) else []
+
+        sep_re = find_separator_pattern(str(path_a), split_rules)
+        sec_comps: Optional[List[Dict]] = None
+        if sep_re is not None:
+            txn_nums_a: Set[int] = {n for t in _fm_txns_a for n in t.line_numbers}
+            txn_nums_b: Set[int] = {n for t in _fm_txns_b for n in t.line_numbers}
+            secs_a = extract_summary_sections(body_a, nums_a, txn_nums_a, sep_re)
+            secs_b = extract_summary_sections(body_b, nums_b, txn_nums_b, sep_re)
+            sec_comps = compare_summary_sections(secs_a, secs_b) if (secs_a or secs_b) else []
 
         output = format_report(result, report_a, report_b,
                                 include_diff=not args.no_diff,
@@ -2001,6 +2182,10 @@ def main():
                 csv_path = out_p.parent / f"{out_p.stem}_txn.csv"
                 write_txn_csv(txn_comps, csv_path)
                 print(f"TXN CSV  → {csv_path}", file=sys.stderr)
+            if sec_comps:
+                csv_path = out_p.parent / f"{out_p.stem}_sections.csv"
+                write_section_csv(sec_comps, csv_path)
+                print(f"SEC CSV  → {csv_path}", file=sys.stderr)
             if args.extract_txn and split_rules:
                 for p, prefix in ((path_a, "A"), (path_b, "B")):
                     extracted = extract_txn_csv_for_file(
