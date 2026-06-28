@@ -47,6 +47,7 @@ from report_comparator import (
     diff_opcodes,
     load_split_config, SplitRule,
     write_txn_csv, extract_txn_csv_for_file,
+    write_section_csv,
 )
 
 BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
@@ -487,7 +488,8 @@ def pair_card(outcome: FilePairOutcome,
               body_lines_a: List[str],
               body_lines_b: List[str],
               per_page_lines: Optional[List[Tuple[List[str], List[str]]]] = None,
-              file_txn_comparisons: Optional[List[dict]] = None) -> str:
+              file_txn_comparisons: Optional[List[dict]] = None,
+              file_section_comparisons: Optional[List[dict]] = None) -> str:
 
     if outcome.error:
         return (
@@ -619,6 +621,45 @@ def pair_card(outcome: FilePairOutcome,
         )
         txn_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{txn_id}\')">▶ txn</span>'
 
+    # Build the card-level section panel when file_section_comparisons is provided
+    sec_toggle = ''
+    sec_panel  = ''
+    if file_section_comparisons:
+        sec_id = f"sec-{card_id}"
+        sec_script_tags: List[str] = []
+        sec_entries: list = []
+        for si, sc in enumerate(file_section_comparisons):
+            if sc["status"] in ("identical", "changed"):
+                d   = sc["diff"]
+                sr  = d["similarity_ratio"]
+                sa  = d["lines_added"]
+                sd  = d["lines_deleted"]
+                sdid = f"{sec_id}-s{si}"
+                sec_script_tags.append(
+                    _diff_tag(sdid, _diff_rows(sc["lines_a"], sc["lines_b"]))
+                )
+                sec_entries.append([0, sc["name"], sr, sa, sd, sdid])
+            elif sc["status"] == "added":
+                sec_entries.append([1, sc["name"], len(sc["lines_b"])])
+            else:
+                sec_entries.append([2, sc["name"], len(sc["lines_a"])])
+
+        n_id = sum(1 for s in file_section_comparisons if s["status"] == "identical")
+        n_ch = sum(1 for s in file_section_comparisons if s["status"] == "changed")
+        n_ad = sum(1 for s in file_section_comparisons if s["status"] == "added")
+        n_rm = sum(1 for s in file_section_comparisons if s["status"] == "removed")
+        sec_data = {"summary": {"identical": n_id, "changed": n_ch, "added": n_ad, "removed": n_rm},
+                    "sections": sec_entries}
+        sec_data_tag = (f'<script type="application/json" id="{sec_id}-data">'
+                        f'{_json.dumps(sec_data, separators=(",",":"))}</script>')
+        sec_panel = (
+            f'<div class="sec-detail" id="{sec_id}" data-sec-src="{sec_id}-data">'
+            + ''.join(sec_script_tags)
+            + sec_data_tag
+            + '</div>'
+        )
+        sec_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{sec_id}\')">▶ sections</span>'
+
     html = f"""
 <div class="card {v_css}" id="{card_id}" data-verdict="{v_css}">
 
@@ -628,6 +669,7 @@ def pair_card(outcome: FilePairOutcome,
     {match_tag}
     {pages_toggle}
     {txn_toggle}
+    {sec_toggle}
     {diff_toggle}
   </div>
 
@@ -660,6 +702,8 @@ def pair_card(outcome: FilePairOutcome,
   {pages_detail}
 
   {txn_panel}
+
+  {sec_panel}
 
   {diff_panel}
 
@@ -1021,6 +1065,47 @@ function renderTxnPanel(el,txnSrcId){
   el.appendChild(wrap);
   el.dataset.rendered='1';
 }
+function renderSectionsPanel(el,srcId){
+  if(el.dataset.rendered)return;
+  let d=el._secData;
+  if(!d){
+    const script=document.getElementById(srcId);
+    if(!script)return;
+    d=JSON.parse(script.textContent);
+    el._secData=d;
+    script.remove();
+  }
+  const s=d.summary;
+  let hdr=`<div class="txn-summary">Sections:`;
+  if(s.identical)hdr+=` <strong>${s.identical}</strong> identical`;
+  if(s.changed)hdr+=` · <strong style="color:var(--s-moderate)">${s.changed}</strong> changed`;
+  if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
+  if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
+  hdr+='</div>';
+  let tb='';
+  for(const sc of d.sections){
+    if(sc[0]===0){
+      const[,name,ratio,add,ndel,did]=sc;
+      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+      const sim=(ratio*100).toFixed(1)+'%';
+      const chg=`+${add} −${ndel}`;
+      const lbl=ratio===1?'▶ view':'▶ diff';
+      const dcell=`<span class="card-toggle" onclick="toggle(this,'${did}')">${lbl}</span>`;
+      tb+=`<tr class="${css}"><td class="mono">${escHtml(name)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
+      tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>${escHtml(name)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
+    }else if(sc[0]===1){
+      tb+=`<tr class="s-added"><td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td></tr>`;
+    }else{
+      tb+=`<tr class="s-removed"><td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td></tr>`;
+    }
+  }
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Section</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
+  el.appendChild(wrap);
+  el.dataset.rendered='1';
+}
 function renderPages(el){
   if(el.dataset.rendered)return;
   let d=el._pagesData;
@@ -1079,6 +1164,7 @@ async function toggle(btn,id){
   }else{
     if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
     else if(el.dataset.txnSrc&&!el.dataset.rendered)renderTxnPanel(el,el.dataset.txnSrc);
+    else if(el.dataset.secSrc&&!el.dataset.rendered)renderSectionsPanel(el,el.dataset.secSrc);
     else{
       const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
       if(target&&!target.dataset.rendered)await renderDiff(target);
@@ -1307,6 +1393,11 @@ def run(folder_a: Path, folder_b: Path,
             write_txn_csv(outcome.file_txn_comparisons, csv_path)
             print(f"  TXN CSV → {csv_path}", file=sys.stderr)
 
+        if outcome.file_section_comparisons:
+            csv_path = output.parent / f"{stem}_sections.csv"
+            write_section_csv(outcome.file_section_comparisons, csv_path)
+            print(f"  SEC CSV → {csv_path}", file=sys.stderr)
+
         # Generate .bat launcher
         bat_path = output.parent / f"open_bcompare_{stem}.bat"
         bat_url = write_bcompare_bat(pa, pb, bat_path, bcompare_exe,
@@ -1316,7 +1407,8 @@ def run(folder_a: Path, folder_b: Path,
         cards_html += pair_card(outcome, bat_url, url_a, url_b,
                                  win_a, win_b, bcompare_exe, card_id,
                                  body_a, body_b, per_page_lines,
-                                 file_txn_comparisons=outcome.file_txn_comparisons or None)
+                                 file_txn_comparisons=outcome.file_txn_comparisons or None,
+                                 file_section_comparisons=outcome.file_section_comparisons or None)
 
     unmatched_html = unmatched_section(match.only_in_a, match.only_in_b,
                                         linux_base, windows_base)
