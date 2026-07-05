@@ -63,7 +63,7 @@ report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
 | Column | Required | Purpose |
 |--------|----------|---------|
 | `report_pattern` | Yes | Regex matched against the **filename** (not path). First matching row wins. |
-| `split_pattern` | Yes | Regex applied per line. When the captured value changes, a new page starts. |
+| `split_pattern` | No | Regex applied per line. When the captured value changes, a new page starts. If blank, the built-in page-break patterns are used instead. |
 | `sort_pattern` | No | Regex per line to identify transaction boundaries (enables `--transactions`). |
 | `max_txn_lines` | No | Max lines per transaction block. Prevents non-transaction content (like totals) from being absorbed into the preceding transaction. Leave blank for unlimited. |
 | `separator_pattern` | No | Regex matching full separator lines (e.g. lines of dashes). Enables summary-section extraction between separators. |
@@ -73,7 +73,8 @@ report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
 ```csv
 report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
 invoices.*,^INVOICE NO:\s+(\S+),^DATE:\s+(.+),,
-TERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"^[-]{20,}\s*$"
+FERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"[-]{20,}$"
+TOA.*,,,,"\\s*[-]{20,}\\s*$"
 ```
 
 **Row 1 — Invoice files** (`invoices.*`):
@@ -84,11 +85,27 @@ TERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"^[-]{20,}\s*$"
 
 **Row 2 — Terminal files** (`TERM.*`):
 - `split_pattern`: pages split on `PAGE N` lines
-- `sort_pattern`: transactions start at lines containing a terminal sequence like `FNCF509B 005000`
+- `sort_pattern`: transactions start at lines containing a terminal sequence like `ACCD509B 005000`
 - `max_txn_lines`: `3` — each transaction block is capped at 3 lines, so non-transaction content (TERMINAL TOTALS, COUNTS) is not absorbed into the preceding transaction
-- `separator_pattern`: `^[-]{20,}\s*$` — lines of 20+ dashes act as section boundaries. Content between consecutive dash lines that starts with `***` becomes a named summary section (TERMINAL TOTALS, TERMINAL COUNTS, CANISTER LEVEL, etc.)
+- `separator_pattern`: `[-]{20,}$` — lines of 20+ dashes act as section boundaries. Content between consecutive dash lines becomes a named summary section (TERMINAL TOTALS, TERMINAL COUNTS, CANISTER LEVEL, etc.)
+
+**Row 3 — Recap files** (`RECAP.*`):
+- `split_pattern`: blank → built-in page-break detection runs (splits on `PAGE N` header lines)
+- `sort_pattern`: blank → no transaction extraction
+- `separator_pattern`: `\s*[-]{20,}\s*$` — same dash lines, but with `\s*` prefix to handle lines indented by leading spaces
 
 **Note on quoting:** If a regex contains a comma (e.g. `{20,}`), wrap it in double quotes in the CSV so the comma isn't treated as a column separator.
+
+### Invalid regex detection
+
+If any regex in splits.csv is syntactically invalid, the tool exits immediately with a clear error before running any comparison:
+
+```
+ERROR: splits.csv row 3: invalid regex in 'separator_pattern': '[-{20'
+       unterminated character set at position 0
+```
+
+The error names the file, row number (1-based, counting the header as row 1), column name, the bad pattern, and the regex engine's description of the problem.
 
 ---
 
@@ -110,7 +127,17 @@ INVOICE NO: INV-002    ← key changed → starts Page 2
 
 Non-unique keys are handled correctly: if INV-001 appears in two separate blocks, they are grouped into one page (the split fires on the value *transition*, not on each occurrence).
 
-Files that match no CSV row use the built-in delimiter patterns (form-feed, `--- Page N ---`, `PAGE N`, etc.).
+Files that match no CSV row, or rows with a blank `split_pattern`, use the built-in delimiter patterns. The built-in patterns are tried **one at a time in priority order** — the first pattern that splits the file into multiple pages is used and no further patterns run. Priority order (highest first):
+
+1. Standalone `PAGE N` line
+2. Any line ending with `PAGE N` (e.g. `SOMDATE 06/02/26 ... PAGE 341`)
+3. Form-feed character
+4. `--- Page N ---` / `=== Page N ===`
+5. `Page N of M`
+6. Lines of 10+ dashes or underscores
+7. Lines of 10+ asterisks
+
+This ordering ensures that separator lines (`---`) are only consumed as page breaks if no higher-priority pattern (like `PAGE N`) fires first — preserving them for section extraction.
 
 ---
 
@@ -121,18 +148,18 @@ Requires `--transactions` flag on the command line AND a `sort_pattern` in the m
 The `sort_pattern` regex is searched per line across the **entire file body** (not per-page). Every line that matches unconditionally starts a new transaction block, even when the captured value repeats. Each block runs from its match line to the next match line (exclusive).
 
 ```
-  FNCF509B 005000    ← sort_pattern matches, starts Transaction 1 (key="005000")
+  ACCD509B 009000    ← sort_pattern matches, starts Transaction 1 (key="009000")
   line 2 ...
   line 3 ...         ← max_txn_lines=3, so block capped here
-  FNCF509B 005002    ← starts Transaction 2 (key="005002")
+  ACCD509B 009002    ← starts Transaction 2 (key="009002")
   ...
 ```
 
-**max_txn_lines** caps each block at N lines from the match. Use this when non-transaction content (TERMINAL TOTALS, COUNTS sections) follows the last transaction without another `sort_pattern` match — without the cap, those lines would be absorbed into the preceding transaction.
+**max_txn_lines** caps each block at N lines from the match. Use this when non-transaction content (SOME TOTALS, COUNTER sections) follows the last transaction without another `sort_pattern` match — without the cap, those lines would be absorbed into the preceding transaction.
 
 ### Transaction comparison
 
-Transactions from file A and file B are matched by their sort key. Same-key duplicates (e.g. two transactions both keyed "005011") are paired by position within the group (first with first, second with second).
+Transactions from file A and file B are matched by their sort key. Same-key duplicates (e.g. two transactions both keyed "0090002") are paired by position within the group (first with first, second with second).
 
 Results appear in:
 - **HTML report**: `▶ txn` panel per file pair card, with per-transaction diff
@@ -144,20 +171,8 @@ Results appear in:
 
 Requires a `separator_pattern` in the matching CSV row. No command-line flag needed — if the pattern is present, section extraction runs automatically.
 
-The `separator_pattern` regex identifies full separator lines (e.g. lines of 20+ dashes). Content between consecutive separator lines that starts with `***` is extracted as a named summary section.
+The `separator_pattern` regex identifies full separator lines (e.g. lines of 20+ dashes). Every block of content between consecutive separator lines is extracted as a named summary section. The **first non-blank line** of the block becomes the section name — no special header prefix (like `***`) is required.
 
-```
-------------------------------------------------------  ← separator
-*** 13:07:03 TERMINAL TOTALS (06/02)                    ← section name (*** header)
-                                                        
-  CASH-IN    102,240.00   CASH-OUT    17,340.00         ← section content
-  TOTAL DEBITS    22,682.98   TOTAL CREDITS   17,340.00
-  ...
-------------------------------------------------------  ← separator (ends this section)
-*** 13:07:03 TERMINAL COUNTS (06/02)                    ← next section
-  ...
-------------------------------------------------------
-```
 
 **Transaction lines are excluded:** If `--transactions` is also active, lines that belong to identified transactions are skipped during section extraction. This prevents card/transaction data from appearing inside summary sections.
 
@@ -166,11 +181,11 @@ The `separator_pattern` regex identifies full separator lines (e.g. lines of 20+
 ### Section comparison
 
 Sections from file A and file B are matched by normalized name. Normalization strips:
-- Leading `***`
-- Timestamp prefix (HH:MM:SS)
-- Trailing `(date)` suffix
+- Leading `***` (if present)
+- Timestamp prefix (HH:MM:SS, if present)
+- Trailing `(date)` suffix (if present)
 
-So `*** 13:07:03 TERMINAL TOTALS (06/02)` and `*** 13:08:15 TERMINAL TOTALS (06/03)` both normalize to `TERMINAL TOTALS` and are matched.
+So `*** 13:07:03 FINAL TOTALS (06/02)` and `*** 13:08:15 FINAL TOTALS (06/03)` both normalize to `FINAL TOTALS` and are matched. Plain lines without `***` are also normalized (timestamp and date suffix stripping still applies).
 
 Results appear in:
 - **HTML report**: `▶ sections` panel per file pair card, with `▶ view` (identical) or `▶ diff` (changed) per section
@@ -197,7 +212,7 @@ For each TERM file pair, the processing pipeline is:
 2. **Body filtering**: blank lines removed, original line numbers preserved
 3. **Transaction detection** (`--transactions`): `sort_pattern` scanned across whole body; each match starts a new transaction block, capped at 3 lines
 4. **Transaction comparison**: transactions matched A↔B by sort key, diffed
-5. **Section extraction** (`separator_pattern`): body scanned for `---` separator lines; content between separators (excluding transaction-owned lines) that starts with `***` → named summary section
+5. **Section extraction** (`separator_pattern`): body scanned for `---` separator lines; every block between separators (excluding transaction-owned lines) → named summary section (first non-blank line = name)
 6. **Section comparison**: sections matched A↔B by normalized name, diffed
 7. **Full-body diff**: standard line-level diff of the entire body
 
