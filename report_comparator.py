@@ -116,7 +116,7 @@ class ComparisonResult:
 class SplitRule:
     """One row from a --split-config CSV: filename pattern → page-split + optional sort pattern."""
     report_re: re.Pattern
-    split_re: re.Pattern
+    split_re: Optional[re.Pattern] = None
     sort_re: Optional[re.Pattern] = None
     max_txn_lines: Optional[int] = None
     separator_re: Optional[re.Pattern] = None
@@ -124,18 +124,30 @@ class SplitRule:
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
     """Load report_pattern,split_pattern[,sort_pattern[,max_txn_lines[,separator_pattern]]] CSV into SplitRule list."""
+    def _compile(pattern: str, column: str, row_num: int) -> re.Pattern:
+        try:
+            return re.compile(pattern)
+        except re.error as exc:
+            print(
+                f"ERROR: {csv_path} row {row_num}: invalid regex in '{column}': {pattern!r}\n"
+                f"       {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
     rules: List[SplitRule] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            sort_pat = row.get("sort_pattern", "").strip()
-            mtl_raw  = row.get("max_txn_lines", "").strip()
-            sep_pat  = row.get("separator_pattern", "").strip()
+        for row_num, row in enumerate(csv.DictReader(f), start=2):
+            sort_pat   = row.get("sort_pattern", "").strip()
+            split_pat  = row.get("split_pattern", "").strip()
+            mtl_raw    = row.get("max_txn_lines", "").strip()
+            sep_pat    = row.get("separator_pattern", "").strip()
             rules.append(SplitRule(
-                report_re=re.compile(row["report_pattern"]),
-                split_re=re.compile(row["split_pattern"]),
-                sort_re=re.compile(sort_pat) if sort_pat else None,
+                report_re=_compile(row["report_pattern"], "report_pattern", row_num),
+                split_re=_compile(split_pat, "split_pattern", row_num) if split_pat else None,
+                sort_re=_compile(sort_pat, "sort_pattern", row_num) if sort_pat else None,
                 max_txn_lines=int(mtl_raw) if mtl_raw else None,
-                separator_re=re.compile(sep_pat) if sep_pat else None,
+                separator_re=_compile(sep_pat, "separator_pattern", row_num) if sep_pat else None,
             ))
     return rules
 
@@ -195,6 +207,7 @@ def find_separator_pattern(filename: str,
 # Common page-break patterns in text reports
 _PAGE_BREAK_PATTERNS = [
     r'^\s*PAGE\s+\d+\s*$',                             # PAGE 1 / PAGE  2
+    r'^.*\bPAGE\s+\d+\s*$',                            # any content ... PAGE N (e.g. SETDATE 06/02/26 ... PAGE 341)
     r'\f',                                          # form-feed character
     r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',           # --- Page 3 ---
     r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',            # === Page 3 ===
@@ -203,9 +216,7 @@ _PAGE_BREAK_PATTERNS = [
     r'^\*{10,}\s*$',                                 # ************   (must start at col 0)
 ]
 
-_PAGE_BREAK_RE = re.compile(
-    "|".join(_PAGE_BREAK_PATTERNS), re.MULTILINE
-)
+_PAGE_BREAK_RES = [re.compile(p, re.MULTILINE) for p in _PAGE_BREAK_PATTERNS]
 
 
 def _split_by_value_change(text: str, pattern: re.Pattern) -> List[List[str]]:
@@ -254,26 +265,28 @@ def split_into_pages(text: str,
     # Normalise line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    # Split on page-break markers
-    chunks = _PAGE_BREAK_RE.split(text)
+    def _chunks_to_pages(chunks: List[str]) -> List[List[str]]:
+        out = []
+        for chunk in chunks:
+            lines = chunk.split("\n")
+            while lines and not lines[0].strip():
+                lines.pop(0)
+            while lines and not lines[-1].strip():
+                lines.pop()
+            if lines:
+                out.append(lines)
+        return out
 
-    pages = []
-    for chunk in chunks:
-        lines = chunk.split("\n")
-        # Strip purely blank leading/trailing lines per page
-        while lines and not lines[0].strip():
-            lines.pop(0)
-        while lines and not lines[-1].strip():
-            lines.pop()
-        if lines:
-            pages.append(lines)
+    # Try each page-break pattern in order; stop at the first that splits the file
+    for pat in _PAGE_BREAK_RES:
+        chunks = pat.split(text)
+        if len(chunks) > 1:
+            pages = _chunks_to_pages(chunks)
+            if pages:
+                return pages
 
-    # Fallback: if no page breaks found, treat whole file as one page
-    if not pages:
-        lines = text.split("\n")
-        pages.append(lines)
-
-    return pages
+    # Fallback: no page breaks found — whole file is one page
+    return [text.split("\n")]
 
 
 # ---------------------------------------------------------------------------
@@ -1140,12 +1153,14 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
 # after removing transaction-owned lines)
 # ---------------------------------------------------------------------------
 
-_SECTION_HEADER_RE = re.compile(r'^\*{3}')
-
-
 def _normalize_section_name(line: str) -> str:
-    """Strip ***, leading HH:MM:SS, and trailing (date/...) from a *** header line."""
-    s = re.sub(r'^\*+\s*', '', line.strip())
+    """Derive a stable match key from a section header line.
+
+    Strips optional leading ***, leading HH:MM:SS timestamp, trailing (date/...)
+    suffix, and surrounding whitespace so that sections with different timestamps
+    or dates still match across runs.
+    """
+    s = re.sub(r'^\*+\s*', '', line.strip())   # remove leading *** if present
     s = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', s)
     s = re.split(r'\s*\(', s)[0].strip()
     return s
@@ -1172,12 +1187,13 @@ def extract_summary_sections(
         if not collecting_lines:
             return
         first = next((l for l in collecting_lines if l.strip()), "")
-        if _SECTION_HEADER_RE.match(first.lstrip()):
-            sections.append({
-                "name":         first.strip(),
-                "lines":        list(collecting_lines),
-                "line_numbers": list(collecting_nums),
-            })
+        if not first:
+            return
+        sections.append({
+            "name":         first.strip(),
+            "lines":        list(collecting_lines),
+            "line_numbers": list(collecting_nums),
+        })
 
     for line, num in zip(body_lines, body_nums):
         if separator_re.match(line):          # separator always defines boundary
