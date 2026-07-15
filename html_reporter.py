@@ -13,11 +13,6 @@ Usage:
         --linux-base /sessions/dreamy-admiring-noether/mnt/outputs \\
         --windows-base "C:\\Users\\kalia\\...\\outputs"
 
-    # Fuzzy matching + custom Beyond Compare path
-    python html_reporter.py folder_a/ folder_b/ --output results/report.html \\
-        --fuzzy-match --fuzzy-threshold 0.60 \\
-        --bcompare "C:\\Program Files\\Beyond Compare 4\\BCompare.exe"
-
     # Ignore date/time differences
     python html_reporter.py folder_a/ folder_b/ --output results/report.html --ignore-dates
 
@@ -49,9 +44,6 @@ from report_comparator import (
     write_txn_csv, extract_txn_csv_for_file,
     write_section_csv,
 )
-
-BCOMPARE_DEFAULT_WIN = r"C:\Program Files\Beyond Compare 4\BCompare.exe"
-
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -88,27 +80,6 @@ def resolve_paths(path: Path,
         win = resolved
         url = to_file_url(resolved)
     return win, url
-
-
-# ---------------------------------------------------------------------------
-# Beyond Compare launcher (.bat)
-# ---------------------------------------------------------------------------
-
-def write_bcompare_bat(file_a: Path, file_b: Path,
-                        bat_path: Path,
-                        bcompare_exe: str,
-                        linux_base: Optional[str],
-                        windows_base: Optional[str]) -> str:
-    """Write a .bat launcher for Beyond Compare; return the bat file URL."""
-    win_a, _ = resolve_paths(file_a, linux_base, windows_base)
-    win_b, _ = resolve_paths(file_b, linux_base, windows_base)
-    content = (
-        "@echo off\n"
-        f'"{bcompare_exe}" "{win_a}" "{win_b}"\n'
-    )
-    bat_path.write_text(content, encoding="utf-8")
-    _, bat_url = resolve_paths(bat_path, linux_base, windows_base)
-    return bat_url
 
 
 # ---------------------------------------------------------------------------
@@ -170,25 +141,6 @@ def file_link(label: str, url: str, name: str) -> str:
         f' {label}: <code>{name}</code></a>'
     )
 
-
-def bcompare_button(bat_url: str, cmd_a: str, cmd_b: str, bcompare_exe: str) -> str:
-    cmd = f'{bcompare_exe} "{cmd_a}" "{cmd_b}"'
-    esc = cmd.replace('"', '&quot;').replace("'", "&#39;")
-    return (
-        f'<div class="bc-row">'
-        f'<a class="btn-bc" href="{bat_url}" download '
-        f'   title="Download launcher then run it to open in Beyond Compare">'
-        f'  <svg viewBox="0 0 20 20" width="16" height="16"><path fill="currentColor" '
-        f'd="M10 2a8 8 0 100 16A8 8 0 0010 2zm1 5v4.586l2.293-2.293 1.414 '
-        f'1.414L10 15.414l-4.707-4.707 1.414-1.414L9 11.586V7h2z"/></svg>'
-        f'  Open in Beyond Compare'
-        f'</a>'
-        f'<button class="btn-copy" onclick="copyCmd(this)" data-cmd="{esc}">'
-        f'  📋 Copy command'
-        f'</button>'
-        f'<code class="bc-cmd">{cmd}</code>'
-        f'</div>'
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -478,12 +430,8 @@ def pages_panel(page_comparisons: List[dict],
 
 
 def pair_card(outcome: FilePairOutcome,
-              bat_url: str,
               file_url_a: str,
               file_url_b: str,
-              win_a: str,
-              win_b: str,
-              bcompare_exe: str,
               card_id: str,
               body_lines_a: List[str],
               body_lines_b: List[str],
@@ -638,7 +586,9 @@ def pair_card(outcome: FilePairOutcome,
                 sec_script_tags.append(
                     _diff_tag(sdid, _diff_rows(sc["lines_a"], sc["lines_b"]))
                 )
-                sec_entries.append([0, sc["name"], sr, sa, sd, sdid])
+                name_b = sc.get("name_b", sc["name"])
+                name_display = sc["name"] if name_b == sc["name"] else f'{sc["name"]} → {name_b}'
+                sec_entries.append([0, name_display, sr, sa, sd, sdid])
             elif sc["status"] == "added":
                 sec_entries.append([1, sc["name"], len(sc["lines_b"])])
             else:
@@ -677,8 +627,6 @@ def pair_card(outcome: FilePairOutcome,
     {file_link("Folder&nbsp;A", file_url_a, outcome.file_a.name)}
     {file_link("Folder&nbsp;B", file_url_b, outcome.file_b.name)}
   </div>
-
-  {bcompare_button(bat_url, win_a, win_b, bcompare_exe)}
 
   <div class="metrics">
     <div class="sim-block">
@@ -749,7 +697,7 @@ CSS = """
   --identical:#16a34a;--minor:#ca8a04;--moderate:#ea580c;--significant:#dc2626;
   --identical-bg:#dcfce7;--minor-bg:#fef9c3;--moderate-bg:#ffedd5;--significant-bg:#fee2e2;
   --s-added:#2563eb;--s-removed:#9ca3af;
-  --btn-bc:#2563eb;--btn-copy:#6b7280;
+  --btn-bc:#2563eb;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);font-size:14px;line-height:1.5}
@@ -805,18 +753,7 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .file-link svg{opacity:.7;flex-shrink:0}
 .file-link code{font-size:12px}
 
-/* Beyond Compare */
-.bc-row{display:flex;align-items:center;gap:10px;padding:10px 18px;
-        border-bottom:1px solid var(--border);flex-wrap:wrap;background:#f0f4ff}
-.btn-bc{display:inline-flex;align-items:center;gap:6px;background:var(--btn-bc);
-        color:#fff;border-radius:6px;padding:5px 14px;font-size:13px;font-weight:500;
-        border:none;cursor:pointer;text-decoration:none;white-space:nowrap}
-.btn-bc:hover{background:#1d4ed8;color:#fff;text-decoration:none}
-.btn-copy{display:inline-flex;align-items:center;gap:4px;background:#fff;
-          color:var(--btn-copy);border:1px solid var(--border);border-radius:6px;
-          padding:5px 12px;font-size:12px;cursor:pointer;white-space:nowrap}
-.btn-copy:hover{border-color:#9ca3af}
-.bc-cmd{font-size:11px;color:var(--muted);word-break:break-all}
+
 
 /* Metrics */
 .metrics{display:flex;gap:0;border-bottom:1px solid var(--border);flex-wrap:wrap}
@@ -1173,14 +1110,7 @@ async function toggle(btn,id){
   el.classList.toggle('open');
   btn.textContent=btn.textContent.replace(wasOpen?'▼':'▶',wasOpen?'▶':'▼');
 }
-function copyCmd(btn){
-  const cmd=btn.getAttribute('data-cmd');
-  navigator.clipboard.writeText(cmd).then(()=>{
-    const orig=btn.textContent;
-    btn.textContent='✓ Copied!';
-    setTimeout(()=>btn.textContent=orig,1800);
-  });
-}
+
 function setFilter(verdict){
   const btns=document.querySelectorAll('.filter-btn');
   btns.forEach(b=>b.classList.remove('active'));
@@ -1328,7 +1258,6 @@ def run(folder_a: Path, folder_b: Path,
         use_semantic: bool,
         linux_base: Optional[str],
         windows_base: Optional[str],
-        bcompare_exe: str,
         ignore_dates: bool = False,
         ignore_line_patterns: Optional[List[str]] = None,
         split_rules: Optional[List[SplitRule]] = None,
@@ -1379,8 +1308,8 @@ def run(folder_a: Path, folder_b: Path,
         outcome = compare_folder_pair(pa, pb, mtype, mratio, use_semantic, ignore_dates, ignore_line_patterns, split_rules=split_rules, transactions=transactions)
         outcomes.append(outcome)
 
-        win_a, url_a = resolve_paths(pa, linux_base, windows_base)
-        win_b, url_b = resolve_paths(pb, linux_base, windows_base)
+        _, url_a = resolve_paths(pa, linux_base, windows_base)
+        _, url_b = resolve_paths(pb, linux_base, windows_base)
 
         body_a = outcome.body_lines_a
         body_b = outcome.body_lines_b
@@ -1398,14 +1327,8 @@ def run(folder_a: Path, folder_b: Path,
             write_section_csv(outcome.file_section_comparisons, csv_path)
             print(f"  SEC CSV → {csv_path}", file=sys.stderr)
 
-        # Generate .bat launcher
-        bat_path = output.parent / f"open_bcompare_{stem}.bat"
-        bat_url = write_bcompare_bat(pa, pb, bat_path, bcompare_exe,
-                                      linux_base, windows_base)
-
         card_id = f"card-{i}"
-        cards_html += pair_card(outcome, bat_url, url_a, url_b,
-                                 win_a, win_b, bcompare_exe, card_id,
+        cards_html += pair_card(outcome, url_a, url_b, card_id,
                                  body_a, body_b, per_page_lines,
                                  file_txn_comparisons=outcome.file_txn_comparisons or None,
                                  file_section_comparisons=outcome.file_section_comparisons or None)
@@ -1418,7 +1341,6 @@ def run(folder_a: Path, folder_b: Path,
 
     output.write_text(html, encoding="utf-8")
     print(f"\nHTML report → {output}", file=sys.stderr)
-    print(f"  Also wrote {len(all_pairs)} .bat launcher(s) to {output.parent}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1449,9 +1371,6 @@ def main():
                    help="Linux absolute path of the outputs root (for path remapping)")
     p.add_argument("--windows-base",
                    help="Windows absolute path of the outputs root (for file:// links)")
-    p.add_argument("--bcompare",
-                   default=BCOMPARE_DEFAULT_WIN,
-                   help=f"Path to BCompare.exe (default: {BCOMPARE_DEFAULT_WIN})")
     p.add_argument("--split-config", metavar="CSV",
                    help="CSV with report_pattern,split_pattern[,sort_pattern] columns; "
                         "matched files use value-change page splitting instead of delimiter patterns")
@@ -1476,7 +1395,6 @@ def main():
         use_semantic   = args.semantic,
         linux_base     = args.linux_base,
         windows_base   = args.windows_base,
-        bcompare_exe   = args.bcompare,
         ignore_dates          = args.ignore_dates,
         ignore_line_patterns  = args.ignore_lines or None,
         split_rules           = load_split_config(args.split_config) if args.split_config else None,
