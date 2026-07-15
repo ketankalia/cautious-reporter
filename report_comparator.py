@@ -1153,18 +1153,6 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
 # after removing transaction-owned lines)
 # ---------------------------------------------------------------------------
 
-def _normalize_section_name(line: str) -> str:
-    """Derive a stable match key from a section header line.
-
-    Strips optional leading ***, leading HH:MM:SS timestamp, trailing (date/...)
-    suffix, and surrounding whitespace so that sections with different timestamps
-    or dates still match across runs.
-    """
-    s = re.sub(r'^\*+\s*', '', line.strip())   # remove leading *** if present
-    s = re.sub(r'^\d{2}:\d{2}:\d{2}\s*', '', s)
-    s = re.split(r'\s*\(', s)[0].strip()
-    return s
-
 
 def extract_summary_sections(
     body_lines: List[str],
@@ -1214,52 +1202,32 @@ def compare_summary_sections(
     secs_a: List[Dict],
     secs_b: List[Dict],
 ) -> List[Dict]:
-    """Match sections by normalized name (group-index for duplicates) and diff them."""
-    from collections import defaultdict
-
-    groups_a: Dict[str, list] = defaultdict(list)
-    groups_b: Dict[str, list] = defaultdict(list)
-    for s in secs_a:
-        groups_a[_normalize_section_name(s["name"])].append(s)
-    for s in secs_b:
-        groups_b[_normalize_section_name(s["name"])].append(s)
-
-    # preserve encounter order, deduplicate
-    seen: dict = {}
-    for s in secs_a + secs_b:
-        k = _normalize_section_name(s["name"])
-        if k not in seen:
-            seen[k] = None
-    all_keys = list(seen)
-
+    """Match sections positionally by separator order and diff them."""
     results: List[Dict] = []
-    for key in all_keys:
-        as_ = groups_a.get(key, [])
-        bs_ = groups_b.get(key, [])
-        for i in range(max(len(as_), len(bs_))):
-            if i < len(as_) and i < len(bs_):
-                diff = line_diff_stats(as_[i]["lines"], bs_[i]["lines"])
-                status = "identical" if diff["similarity_ratio"] == 1.0 else "changed"
-                results.append({
-                    "status":  status,
-                    "name":    as_[i]["name"],
-                    "name_b":  bs_[i]["name"],
-                    "lines_a": as_[i]["lines"],
-                    "lines_b": bs_[i]["lines"],
-                    "diff":    diff,
-                })
-            elif i < len(as_):
-                results.append({
-                    "status":  "removed",
-                    "name":    as_[i]["name"],
-                    "lines_a": as_[i]["lines"],
-                })
-            else:
-                results.append({
-                    "status":  "added",
-                    "name":    bs_[i]["name"],
-                    "lines_b": bs_[i]["lines"],
-                })
+    for i in range(max(len(secs_a), len(secs_b))):
+        if i < len(secs_a) and i < len(secs_b):
+            diff = line_diff_stats(secs_a[i]["lines"], secs_b[i]["lines"])
+            status = "identical" if diff["similarity_ratio"] == 1.0 else "changed"
+            results.append({
+                "status":  status,
+                "name":    secs_a[i]["name"],
+                "name_b":  secs_b[i]["name"],
+                "lines_a": secs_a[i]["lines"],
+                "lines_b": secs_b[i]["lines"],
+                "diff":    diff,
+            })
+        elif i < len(secs_a):
+            results.append({
+                "status":  "removed",
+                "name":    secs_a[i]["name"],
+                "lines_a": secs_a[i]["lines"],
+            })
+        else:
+            results.append({
+                "status":  "added",
+                "name":    secs_b[i]["name"],
+                "lines_b": secs_b[i]["lines"],
+            })
     return results
 
 
