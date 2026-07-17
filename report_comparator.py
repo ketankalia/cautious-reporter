@@ -295,12 +295,15 @@ def split_into_pages(text: str,
 
 def detect_repeating_lines(pages: List[List[str]],
                             check_lines: int = 3,
-                            min_frequency: float = 0.6) -> Tuple[List[str], List[str]]:
+                            min_frequency: float = 0.6,
+                            separator_re: Optional[re.Pattern] = None) -> Tuple[List[str], List[str]]:
     """
     Identify lines that appear in the same position (top or bottom) across
     a majority of pages — these are likely headers/footers.
 
     Returns (header_candidates, footer_candidates) as lists of stripped strings.
+    Lines matching separator_re are excluded from footer candidates so they are
+    never stripped from page bodies during section extraction.
     """
     if len(pages) < 2:
         return [], []
@@ -310,9 +313,10 @@ def detect_repeating_lines(pages: List[List[str]],
     top_series = pd.Series(
         [line.strip() for page in pages for line in page[:check_lines]]
     )
-    bot_series = pd.Series(
-        [line.strip() for page in pages for line in page[-check_lines:]]
-    )
+    bot_lines = [line for page in pages for line in page[-check_lines:]]
+    if separator_re is not None:
+        bot_lines = [ln for ln in bot_lines if not separator_re.match(ln)]
+    bot_series = pd.Series([ln.strip() for ln in bot_lines])
 
     top_counts = top_series[top_series != ""].value_counts()
     bot_counts = bot_series[bot_series != ""].value_counts()
@@ -326,10 +330,12 @@ def detect_repeating_lines(pages: List[List[str]],
 def strip_header_footer(page_lines: List[str],
                         headers: List[str],
                         footers: List[str],
-                        check_lines: int = 3) -> Tuple[List[str], List[str], List[str]]:
+                        check_lines: int = 3,
+                        separator_re: Optional[re.Pattern] = None) -> Tuple[List[str], List[str], List[str]]:
     """
     Remove header and footer lines from a page.
     Returns (header_lines, body_lines, footer_lines).
+    Lines matching separator_re are never stripped as footers.
     """
     lines = list(page_lines)
     found_headers = []
@@ -348,7 +354,8 @@ def strip_header_footer(page_lines: List[str],
     i = len(lines) - 1
     stripped_foot = 0
     while i >= max(0, len(lines) - check_lines) and stripped_foot < check_lines:
-        if lines[i].strip() in footers:
+        is_sep = separator_re is not None and separator_re.match(lines[i])
+        if not is_sep and lines[i].strip() in footers:
             found_footers.insert(0, lines[i])
             lines.pop(i)
             stripped_foot += 1
@@ -412,7 +419,8 @@ def extract_sections(body_lines: List[str], body_line_numbers: List[int] = None)
 
 def parse_report(filename: str, ignore_dates: bool = False,
                  ignore_line_patterns: Optional[List[str]] = None,
-                 split_pattern: Optional[re.Pattern] = None) -> ParsedReport:
+                 split_pattern: Optional[re.Pattern] = None,
+                 separator_re: Optional[re.Pattern] = None) -> ParsedReport:
     """Top-level parser: read file → pages → header/footer → sections."""
     try:
         with open(filename, "r", encoding="utf-8", errors="replace") as f:
@@ -424,7 +432,7 @@ def parse_report(filename: str, ignore_dates: bool = False,
     report = ParsedReport(filename=filename)
 
     raw_pages = split_into_pages(text, split_pattern=split_pattern)
-    global_headers, global_footers = detect_repeating_lines(raw_pages)
+    global_headers, global_footers = detect_repeating_lines(raw_pages, separator_re=separator_re)
 
     report.global_header = global_headers
     report.global_footer = global_footers
@@ -448,7 +456,7 @@ def parse_report(filename: str, ignore_dates: bool = False,
     all_body_line_nums: List[int] = []
 
     for i, raw_lines in enumerate(raw_pages):
-        h, body, f = strip_header_footer(raw_lines, global_headers, global_footers)
+        h, body, f = strip_header_footer(raw_lines, global_headers, global_footers, separator_re=separator_re)
         # Compute positions against the pre-mask body so they match the raw file
         page_nums = [_raw_line_num(ln) for ln in body]
         if _cpats:
@@ -1724,8 +1732,9 @@ def compare_folder_pair(path_a: Path,
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
         split_pat = find_split_pattern(str(path_a), split_rules)
-        ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
-        rb = parse_report(str(path_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
+        sep_re    = find_separator_pattern(str(path_a), split_rules)
+        ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
+        rb = parse_report(str(path_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
 
         def _filter(lines: List[str], nums: List[int]):
             pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
@@ -1875,9 +1884,10 @@ def _write_pair_report(outcome: FilePairOutcome,
                 f"{outcome.error}\n")
     else:
         split_pat = find_split_pattern(str(outcome.file_a), split_rules)
+        sep_re    = find_separator_pattern(str(outcome.file_a), split_rules)
         # Re-parse to get full objects for the formatter
-        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
-        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat)
+        ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
+        rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
         txn_comps = outcome.file_txn_comparisons if transactions else None
         text = format_report(outcome.result, ra, rb, include_diff=include_diff,
                              txn_comparisons=txn_comps)
@@ -2122,10 +2132,11 @@ def main():
         split_pat  = find_split_pattern(str(path_a), split_rules)
         sort_re    = find_sort_pattern(str(path_a), split_rules)
         max_txn_ln = find_max_txn_lines(str(path_a), split_rules)
+        sep_re     = find_separator_pattern(str(path_a), split_rules)
         print(f"Parsing  : {path_a}", file=sys.stderr)
-        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
+        report_a = parse_report(str(path_a), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat, separator_re=sep_re)
         print(f"Parsing  : {path_b}", file=sys.stderr)
-        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat)
+        report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat, separator_re=sep_re)
 
         print("Comparing...", file=sys.stderr)
         result = compare_reports(report_a, report_b, use_semantic=args.semantic)
