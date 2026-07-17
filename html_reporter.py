@@ -785,13 +785,18 @@ h1{font-size:22px;font-weight:700;margin-bottom:4px}
 .sec-summary .stat-box{border-bottom:none;min-width:80px}
 
 /* Section table */
-.sec-table{width:100%;border-collapse:collapse;font-size:13px}
+.sec-table{width:100%;border-collapse:collapse;font-size:13px;table-layout:fixed}
 .sec-table th{text-align:left;padding:6px 10px;background:#f9fafb;
               border-bottom:2px solid var(--border);color:var(--muted);font-weight:600;font-size:12px}
 .sec-table td{padding:6px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
 .sec-table tr:last-child td{border-bottom:none}
 .sec-table .num{text-align:right}
 .sec-table .mono{font-family:monospace;font-size:12px}
+.sec-table th:nth-child(2),.sec-table td:nth-child(2){width:90px}
+.sec-table th:nth-child(3),.sec-table td:nth-child(3){width:80px}
+.sec-table th:nth-child(4),.sec-table td:nth-child(4){width:90px}
+.sec-table th:nth-child(5),.sec-table td:nth-child(5){width:65px}
+.sec-table tr:not(.diff-row) td:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .sec-table tr.s-identical td:first-child{border-left:3px solid var(--identical)}
 .sec-table tr.s-minor td:first-child{border-left:3px solid var(--minor)}
 .sec-table tr.s-moderate td:first-child{border-left:3px solid var(--moderate)}
@@ -988,7 +993,7 @@ function renderTxnPanel(el,txnSrcId){
       const sim=(ratio*100).toFixed(1)+'%';
       const chg=`+${add} −${ndel}`;
       const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
-      tb+=`<tr class="${css}"><td class="mono">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
+      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
       if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Txn: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
     }else if(t[0]===1){
       tb+=`<tr class="s-added"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
@@ -1029,7 +1034,7 @@ function renderSectionsPanel(el,srcId){
       const chg=`+${add} −${ndel}`;
       const lbl=ratio===1?'▶ view':'▶ diff';
       const dcell=`<span class="card-toggle" onclick="toggle(this,'${did}')">${lbl}</span>`;
-      tb+=`<tr class="${css}"><td class="mono">${escHtml(name)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
+      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(name)}">${escHtml(name)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
       tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>${escHtml(name)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
     }else if(sc[0]===1){
       tb+=`<tr class="s-added"><td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td></tr>`;
