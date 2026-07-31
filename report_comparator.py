@@ -52,9 +52,9 @@ import math
 import pandas as pd
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple, Set
+from typing import Callable, List, Dict, Optional, Tuple, Set, Union
 
-from date_utils import filter_lines, has_dates, first_date_match
+from date_utils import filter_lines, has_dates, first_date_match, remove_dates_from_line
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,15 @@ class Transaction:
 
 
 @dataclass
+class CsvRow:
+    key: str               # "|"-joined values of all key columns (used for matching and display)
+    sort_val: tuple        # tuple of _parse_sort_val(fields[i]) per key col (used for ordering)
+    fields: List[str] = field(default_factory=list)
+    line: str = ""         # original raw CSV line (fed to _diff_rows for field-level highlighting)
+    line_number: int = 0
+
+
+@dataclass
 class ParsedReport:
     filename: str
     pages: List[Page] = field(default_factory=list)
@@ -120,10 +129,18 @@ class SplitRule:
     sort_re: Optional[re.Pattern] = None
     max_txn_lines: Optional[int] = None
     separator_re: Optional[re.Pattern] = None
+    csv_key_cols: Optional[List[int]] = None   # 0-based column indices forming the composite match key
+    csv_has_header: bool = False
 
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
-    """Load report_pattern,split_pattern[,sort_pattern[,max_txn_lines[,separator_pattern]]] CSV into SplitRule list."""
+    """Load split-config CSV into SplitRule list.
+
+    Columns: report_pattern, split_pattern, sort_pattern, max_txn_lines,
+             separator_pattern, csv_key_col, csv_has_header
+    All columns after report_pattern are optional.
+    csv_key_col accepts a single index (e.g. 0) or comma-separated indices (e.g. "0,2").
+    """
     def _compile(pattern: str, column: str, row_num: int) -> re.Pattern:
         try:
             return re.compile(pattern)
@@ -138,16 +155,24 @@ def load_split_config(csv_path: str) -> List["SplitRule"]:
     rules: List[SplitRule] = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row_num, row in enumerate(csv.DictReader(f), start=2):
-            sort_pat   = row.get("sort_pattern", "").strip()
-            split_pat  = row.get("split_pattern", "").strip()
-            mtl_raw    = row.get("max_txn_lines", "").strip()
-            sep_pat    = row.get("separator_pattern", "").strip()
+            sort_pat    = (row.get("sort_pattern") or "").strip()
+            split_pat   = (row.get("split_pattern") or "").strip()
+            mtl_raw     = (row.get("max_txn_lines") or "").strip()
+            sep_pat     = (row.get("separator_pattern") or "").strip()
+            key_col_raw = (row.get("csv_key_col") or "").strip()
+            has_hdr_raw = (row.get("csv_has_header") or "").strip().lower()
+            csv_key_cols = (
+                [int(x.strip()) for x in key_col_raw.split(",")]
+                if key_col_raw else None
+            )
             rules.append(SplitRule(
                 report_re=_compile(row["report_pattern"], "report_pattern", row_num),
                 split_re=_compile(split_pat, "split_pattern", row_num) if split_pat else None,
                 sort_re=_compile(sort_pat, "sort_pattern", row_num) if sort_pat else None,
                 max_txn_lines=int(mtl_raw) if mtl_raw else None,
                 separator_re=_compile(sep_pat, "separator_pattern", row_num) if sep_pat else None,
+                csv_key_cols=csv_key_cols,
+                csv_has_header=has_hdr_raw == "true",
             ))
     return rules
 
@@ -198,6 +223,30 @@ def find_separator_pattern(filename: str,
         if rule.report_re.search(name):
             return rule.separator_re
     return None
+
+
+def find_csv_key_cols(filename: str,
+                      rules: Optional[List["SplitRule"]]) -> Optional[List[int]]:
+    """Return csv_key_cols for the first matching rule, else None."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.csv_key_cols
+    return None
+
+
+def find_csv_has_header(filename: str,
+                        rules: Optional[List["SplitRule"]]) -> bool:
+    """Return csv_has_header for the first matching rule, else False."""
+    if not rules:
+        return False
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.csv_has_header
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -463,8 +512,6 @@ def parse_report(filename: str, ignore_dates: bool = False,
             keep = [not any(c.search(l) for c in _cpats) for l in body]
             body = [l for l, k in zip(body, keep) if k]
             page_nums = [n for n, k in zip(page_nums, keep) if k]
-        if ignore_dates:
-            body = filter_lines(body)
         page = Page(number=i + 1,
                     raw_lines=raw_lines,
                     header_lines=h,
@@ -540,7 +587,8 @@ def _string_similarity(a: str, b: str) -> float:
 
 
 def diff_opcodes(
-    lines_a: List[str], lines_b: List[str]
+    lines_a: List[str], lines_b: List[str],
+    normalize: Optional[Callable[[str], str]] = None,
 ) -> List[Tuple[str, int, int, int, int]]:
     """Return difflib-style opcodes for two line sequences.
 
@@ -560,14 +608,22 @@ def diff_opcodes(
 
     # Step 1 — assign in-order occurrence ranks (fully vectorised)
     df_a = pd.DataFrame({'line': lines_a, 'pos_a': range(len(lines_a))})
-    df_a['rank'] = df_a.groupby('line', sort=False).cumcount()
-
     df_b = pd.DataFrame({'line': lines_b, 'pos_b': range(len(lines_b))})
-    df_b['rank'] = df_b.groupby('line', sort=False).cumcount()
 
-    # Step 2 — merge on (line, rank) → valid in-order match pairs
+    if normalize is not None:
+        df_a['key'] = df_a['line'].map(normalize)
+        df_b['key'] = df_b['line'].map(normalize)
+        df_a['rank'] = df_a.groupby('key', sort=False).cumcount()
+        df_b['rank'] = df_b.groupby('key', sort=False).cumcount()
+        merge_key = 'key'
+    else:
+        df_a['rank'] = df_a.groupby('line', sort=False).cumcount()
+        df_b['rank'] = df_b.groupby('line', sort=False).cumcount()
+        merge_key = 'line'
+
+    # Step 2 — merge on (key/line, rank) → valid in-order match pairs
     matches = (
-        df_a.merge(df_b, on=['line', 'rank'])[['pos_a', 'pos_b']]
+        df_a.merge(df_b, on=[merge_key, 'rank'])[['pos_a', 'pos_b']]
         .sort_values('pos_a')
         .reset_index(drop=True)
     )
@@ -676,15 +732,18 @@ def _grouped_opcodes(
     return groups
 
 
-def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
+def line_diff_stats(lines_a: List[str], lines_b: List[str],
+                    normalize: Optional[Callable[[str], str]] = None) -> Dict:
     """Compute line-level diff stats (pandas multiset hash-join, O(n+m)).
 
     Uses value_counts() + index intersection to count matching lines by
     frequency (Dice coefficient). Consistent at all input sizes — no
     difflib recursion risk and no split-threshold inconsistency.
     """
-    cnt_a  = pd.Series(lines_a).value_counts()
-    cnt_b  = pd.Series(lines_b).value_counts()
+    cmp_a = [normalize(l) for l in lines_a] if normalize else lines_a
+    cmp_b = [normalize(l) for l in lines_b] if normalize else lines_b
+    cnt_a  = pd.Series(cmp_a).value_counts()
+    cnt_b  = pd.Series(cmp_b).value_counts()
     idx    = cnt_a.index.intersection(cnt_b.index)
     common = int(cnt_a[idx].combine(cnt_b[idx], min).sum()) if len(idx) else 0
     added   = len(lines_b) - common
@@ -707,9 +766,10 @@ def line_diff_stats(lines_a: List[str], lines_b: List[str]) -> Dict:
 def unified_diff_text(lines_a: List[str], lines_b: List[str],
                       label_a: str = "Report A",
                       label_b: str = "Report B",
-                      context: int = 3) -> str:
+                      context: int = 3,
+                      normalize: Optional[Callable[[str], str]] = None) -> str:
     """Return a unified diff string (pandas LCS engine; scales to any file size)."""
-    opcodes = diff_opcodes(lines_a, lines_b)
+    opcodes = diff_opcodes(lines_a, lines_b, normalize=normalize)
     if not opcodes or all(op[0] == 'equal' for op in opcodes):
         return ""
 
@@ -888,7 +948,8 @@ def match_sections(sections_a: List[Section],
 
 def compare_sections(sections_a: List[Section],
                      sections_b: List[Section],
-                     use_semantic: bool = False) -> List[Dict]:
+                     use_semantic: bool = False,
+                     normalize: Optional[Callable[[str], str]] = None) -> List[Dict]:
     """Compare sections pairwise and return per-section results."""
     pairs = match_sections(sections_a, sections_b)
     results = []
@@ -912,7 +973,7 @@ def compare_sections(sections_a: List[Section],
             entry["lines_b"] = lines_b
             entry["line_numbers_a"] = [n for _, n in lines_a_pairs]
             entry["line_numbers_b"] = [n for _, n in lines_b_pairs]
-            diff = line_diff_stats(lines_a, lines_b)
+            diff = line_diff_stats(lines_a, lines_b, normalize=normalize)
             entry["diff"] = diff
             if use_semantic:
                 entry["semantic_similarity"] = semantic_similarity(
@@ -1097,7 +1158,8 @@ def identify_transactions(
 
 
 def compare_transactions(txns_a: List[Transaction],
-                         txns_b: List[Transaction]) -> List[Dict]:
+                         txns_b: List[Transaction],
+                         normalize: Optional[Callable[[str], str]] = None) -> List[Dict]:
     """Match transactions by sort_key and return matched/added/removed dicts.
 
     Transactions with the same sort_key are paired by index within the group
@@ -1128,7 +1190,7 @@ def compare_transactions(txns_a: List[Transaction],
                     "sort_key": key,
                     "txn_a":    as_[i],
                     "txn_b":    bs_[i],
-                    "diff":     line_diff_stats(as_[i].lines, bs_[i].lines),
+                    "diff":     line_diff_stats(as_[i].lines, bs_[i].lines, normalize=normalize),
                 })
             elif i < len(as_):
                 results.append({"status": "removed", "sort_key": key, "txn_a": as_[i]})
@@ -1157,6 +1219,128 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# CSV ROW COMPARISON  (key-based row matching for .csv files)
+# ---------------------------------------------------------------------------
+
+
+def parse_csv_rows(
+    body_lines: List[str],
+    body_nums: List[int],
+    csv_key_cols: List[int],
+    has_header: bool,
+) -> tuple:
+    """Parse body lines as CSV and return (header_fields_or_None, list_of_CsvRow).
+
+    Uses csv.reader so quoted commas inside fields are handled correctly.
+    When has_header=True the first non-empty line is treated as the header row
+    and returned as a List[str]; it is excluded from the returned CsvRow list.
+    """
+    import io as _io
+
+    header_fields: Optional[List[str]] = None
+    rows: List[CsvRow] = []
+
+    for line, num in zip(body_lines, body_nums):
+        if not line.strip():
+            continue
+        try:
+            fields = next(csv.reader(_io.StringIO(line)))
+        except Exception:
+            fields = [line]
+
+        if has_header and header_fields is None:
+            header_fields = fields
+            continue
+
+        key_parts: List[str] = []
+        sort_parts: List[object] = []
+        for col in csv_key_cols:
+            val = fields[col].strip() if col < len(fields) else ""
+            key_parts.append(val)
+            sort_parts.append(_parse_sort_val(val))
+
+        rows.append(CsvRow(
+            key="|".join(key_parts),
+            sort_val=tuple(sort_parts),
+            fields=fields,
+            line=line,
+            line_number=num,
+        ))
+
+    return header_fields, rows
+
+
+def compare_csv_rows(
+    rows_a: List[CsvRow],
+    rows_b: List[CsvRow],
+    normalize: Optional[Callable[[str], str]] = None,
+) -> List[Dict]:
+    """Match CSV rows by composite key and return matched/added/removed dicts.
+
+    Rows with the same key are paired by occurrence index within the group
+    (first-in-A with first-in-B) to handle duplicate keys.
+    Output is sorted by key using the same date-aware comparator as transactions.
+    """
+    from collections import defaultdict
+
+    groups_a: Dict[str, List[CsvRow]] = defaultdict(list)
+    groups_b: Dict[str, List[CsvRow]] = defaultdict(list)
+    for r in rows_a:
+        groups_a[r.key].append(r)
+    for r in rows_b:
+        groups_b[r.key].append(r)
+
+    # Use first-seen sort_val for ordering within each key
+    sort_val_map: Dict[str, tuple] = {}
+    for r in rows_a + rows_b:
+        sort_val_map.setdefault(r.key, r.sort_val)
+
+    all_keys = sorted(
+        set(groups_a) | set(groups_b),
+        key=lambda k: tuple(_sort_key_comparable(v) for v in sort_val_map[k]),
+    )
+
+    results: List[Dict] = []
+    for key in all_keys:
+        as_ = groups_a.get(key, [])
+        bs_ = groups_b.get(key, [])
+        for i in range(max(len(as_), len(bs_))):
+            if i < len(as_) and i < len(bs_):
+                diff = line_diff_stats([as_[i].line], [bs_[i].line], normalize=normalize)
+                results.append({
+                    "status": "matched",
+                    "key":    key,
+                    "row_a":  as_[i],
+                    "row_b":  bs_[i],
+                    "diff":   diff,
+                })
+            elif i < len(as_):
+                results.append({"status": "removed", "key": key, "row_a": as_[i]})
+            else:
+                results.append({"status": "added",   "key": key, "row_b": bs_[i]})
+    return results
+
+
+def write_csv_row_csv(file_csv_comparisons: List[Dict], csv_path: Path) -> None:
+    """Write CSV row comparison results to a summary CSV file."""
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["key", "status", "similarity_pct", "lines_added", "lines_deleted"])
+        for rc in file_csv_comparisons:
+            key    = rc["key"]
+            status = rc["status"]
+            if status == "matched":
+                d = rc["diff"]
+                w.writerow([key, status,
+                             round(d["similarity_ratio"] * 100, 1),
+                             d["lines_added"], d["lines_deleted"]])
+            elif status == "added":
+                w.writerow([key, status, "", 1, 0])
+            else:
+                w.writerow([key, status, "", 0, 1])
+
+
+# ---------------------------------------------------------------------------
 # SUMMARY SECTION EXTRACTION  (lines between separator_re delimiters,
 # after removing transaction-owned lines)
 # ---------------------------------------------------------------------------
@@ -1168,12 +1352,10 @@ def extract_summary_sections(
     txn_nums: Set[int],
     separator_re: re.Pattern,
 ) -> List[Dict]:
-    """Extract named (***) sections from non-transaction body lines.
+    """Extract sections from non-transaction body lines.
 
     Sections are delimited by lines matching separator_re.  Lines whose
-    original line number is in txn_nums are skipped.  Only blocks whose
-    first non-blank line starts with *** are returned (pre-separator header
-    content is discarded).
+    original line number is in txn_nums are skipped.
     """
     sections: List[Dict] = []
     collecting_lines: List[str] = []
@@ -1209,12 +1391,13 @@ def extract_summary_sections(
 def compare_summary_sections(
     secs_a: List[Dict],
     secs_b: List[Dict],
+    normalize: Optional[Callable[[str], str]] = None,
 ) -> List[Dict]:
     """Match sections positionally by separator order and diff them."""
     results: List[Dict] = []
     for i in range(max(len(secs_a), len(secs_b))):
         if i < len(secs_a) and i < len(secs_b):
-            diff = line_diff_stats(secs_a[i]["lines"], secs_b[i]["lines"])
+            diff = line_diff_stats(secs_a[i]["lines"], secs_b[i]["lines"], normalize=normalize)
             status = "identical" if diff["similarity_ratio"] == 1.0 else "changed"
             results.append({
                 "status":  status,
@@ -1303,7 +1486,8 @@ def extract_txn_csv_for_file(path: Path,
 
 def compare_reports(report_a: ParsedReport,
                     report_b: ParsedReport,
-                    use_semantic: bool = False) -> ComparisonResult:
+                    use_semantic: bool = False,
+                    normalize: Optional[Callable[[str], str]] = None) -> ComparisonResult:
     """Run all comparison dimensions and return a ComparisonResult."""
 
     # -- Structural --
@@ -1338,7 +1522,7 @@ def compare_reports(report_a: ParsedReport,
     body_a = [line for line in report_a.body_lines if line.strip()]
     body_b = [line for line in report_b.body_lines if line.strip()]
     
-    content = line_diff_stats(body_a, body_b)
+    content = line_diff_stats(body_a, body_b, normalize=normalize)
     if use_semantic:
         content["semantic_similarity"] = semantic_similarity(
             "\n".join(body_a),
@@ -1347,7 +1531,7 @@ def compare_reports(report_a: ParsedReport,
 
     # -- Section-level --
     section_results = compare_sections(
-        report_a.sections, report_b.sections, use_semantic=use_semantic
+        report_a.sections, report_b.sections, use_semantic=use_semantic, normalize=normalize
     )
 
     # -- Summary --
@@ -1384,11 +1568,12 @@ def compare_reports(report_a: ParsedReport,
         for i in range(n_matched):
             pg_body_a = [ln for ln in pages_a[i].body_lines if ln.strip()]
             pg_body_b = [ln for ln in pages_b[i].body_lines if ln.strip()]
-            pg_diff = line_diff_stats(pg_body_a, pg_body_b)
+            pg_diff = line_diff_stats(pg_body_a, pg_body_b, normalize=normalize)
             pg_diff_text = unified_diff_text(
                 pg_body_a, pg_body_b,
                 label_a=f"A  page {i + 1}",
                 label_b=f"B  page {i + 1}",
+                normalize=normalize,
             )
             page_comparisons.append({
                 "page_num_a": i + 1,
@@ -1441,7 +1626,9 @@ def format_report(result: ComparisonResult,
                   report_a: ParsedReport,
                   report_b: ParsedReport,
                   include_diff: bool = True,
-                  txn_comparisons: Optional[List[Dict]] = None) -> str:
+                  txn_comparisons: Optional[List[Dict]] = None,
+                  csv_comparisons: Optional[List[Dict]] = None,
+                  normalize: Optional[Callable[[str], str]] = None) -> str:
     lines = []
 
     def h(title: str, char: str = "="):
@@ -1558,6 +1745,30 @@ def format_report(result: ComparisonResult,
         else:
             lines.append("  (no transactions detected)")
 
+    # CSV row comparison
+    if csv_comparisons is not None:
+        h("CSV ROW COMPARISON", "-")
+        if csv_comparisons:
+            n_m = sum(1 for r in csv_comparisons if r["status"] == "matched")
+            n_a = sum(1 for r in csv_comparisons if r["status"] == "added")
+            n_r = sum(1 for r in csv_comparisons if r["status"] == "removed")
+            lines.append(f"  Rows: {n_m} matched, {n_a} added, {n_r} removed")
+            lines.append("")
+            for rc in csv_comparisons:
+                key = rc["key"] or "(no key)"
+                if rc["status"] == "matched":
+                    r2 = rc["diff"]["similarity_ratio"]
+                    flag = f"  similarity: {r2:.1%}" if r2 < 1.0 else "  identical"
+                    chg = (f"  +{rc['diff']['lines_added']}/-{rc['diff']['lines_deleted']}"
+                           if r2 < 1.0 else "")
+                    lines.append(f"  [MATCHED ] {key}{flag}{chg}")
+                elif rc["status"] == "added":
+                    lines.append(f"  [ADDED   ] {key}")
+                else:
+                    lines.append(f"  [REMOVED ] {key}")
+        else:
+            lines.append("  (no CSV rows detected)")
+
     # Diff section: per-page when available, otherwise whole-body
     if include_diff:
         if result.page_comparisons:
@@ -1589,6 +1800,7 @@ def format_report(result: ComparisonResult,
                 report_b.body_lines,
                 label_a=report_a.filename,
                 label_b=report_b.filename,
+                normalize=normalize,
             )
             if diff_text.strip():
                 lines.append(diff_text)
@@ -1607,18 +1819,20 @@ def format_report(result: ComparisonResult,
 # 10.  FOLDER SCANNER
 # ---------------------------------------------------------------------------
 
-def scan_folder(folder: Path, ext: str = ".txt") -> Dict[str, Path]:
+def scan_folder(folder: Path, ext: Union[str, List[str]] = ".txt") -> Dict[str, Path]:
     """
     Return a dict of { filename (lowercase) → absolute Path } for all files
-    with the given extension directly inside *folder* (non-recursive).
+    with the given extension(s) directly inside *folder* (non-recursive).
+    ext may be a single string (".txt") or a list ([".txt", ".csv"]).
     """
     if not folder.is_dir():
         print(f"ERROR: Not a directory: {folder}", file=sys.stderr)
         sys.exit(1)
+    exts = {e.lower() for e in (ext if isinstance(ext, list) else [ext])}
     return {
         p.name.lower(): p
         for p in sorted(folder.iterdir())
-        if p.is_file() and p.suffix.lower() == ext.lower()
+        if p.is_file() and p.suffix.lower() in exts
     }
 
 
@@ -1716,8 +1930,12 @@ class FilePairOutcome:
     per_page_line_numbers: List[Tuple[List[int], List[int]]] = field(default_factory=list)
     # file-level transaction comparisons (whole body, not per-page)
     file_txn_comparisons: List[Dict] = field(default_factory=list)
-    # file-level summary-section comparisons (*** blocks between separator lines)
+    # file-level summary-section comparisons (blocks between separator lines)
     file_section_comparisons: List[Dict] = field(default_factory=list)
+    # file-level CSV row comparisons (key-based row matching)
+    file_csv_comparisons: List[Dict] = field(default_factory=list)
+    csv_header_a: Optional[List[str]] = None
+    csv_header_b: Optional[List[str]] = None
 
 
 def compare_folder_pair(path_a: Path,
@@ -1731,6 +1949,7 @@ def compare_folder_pair(path_a: Path,
                         transactions: bool = False) -> FilePairOutcome:
     """Parse and compare one pair of files. Catches errors gracefully."""
     try:
+        normalize = remove_dates_from_line if ignore_dates else None
         split_pat = find_split_pattern(str(path_a), split_rules)
         sep_re    = find_separator_pattern(str(path_a), split_rules)
         ra = parse_report(str(path_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
@@ -1760,7 +1979,7 @@ def compare_folder_pair(path_a: Path,
                 txns_a = identify_transactions(body_a, nums_a, sort_re, max_txn_ln)
                 txns_b = identify_transactions(body_b, nums_b, sort_re, max_txn_ln)
                 if txns_a or txns_b:
-                    file_txn = compare_transactions(txns_a, txns_b)
+                    file_txn = compare_transactions(txns_a, txns_b, normalize=normalize)
 
         file_sec: List[Dict] = []
         sep_re = find_separator_pattern(str(path_a), split_rules)
@@ -1770,15 +1989,29 @@ def compare_folder_pair(path_a: Path,
             secs_a = extract_summary_sections(body_a, nums_a, txn_nums_a, sep_re)
             secs_b = extract_summary_sections(body_b, nums_b, txn_nums_b, sep_re)
             if secs_a or secs_b:
-                file_sec = compare_summary_sections(secs_a, secs_b)
+                file_sec = compare_summary_sections(secs_a, secs_b, normalize=normalize)
 
-        result = compare_reports(ra, rb, use_semantic=use_semantic)
+        file_csv: List[Dict] = []
+        csv_hdr_a: Optional[List[str]] = None
+        csv_hdr_b: Optional[List[str]] = None
+        csv_key_cols = find_csv_key_cols(str(path_a), split_rules)
+        if csv_key_cols is not None:
+            has_hdr = find_csv_has_header(str(path_a), split_rules)
+            csv_hdr_a, csv_rows_a = parse_csv_rows(body_a, nums_a, csv_key_cols, has_hdr)
+            csv_hdr_b, csv_rows_b = parse_csv_rows(body_b, nums_b, csv_key_cols, has_hdr)
+            if csv_rows_a or csv_rows_b:
+                file_csv = compare_csv_rows(csv_rows_a, csv_rows_b, normalize=normalize)
+
+        result = compare_reports(ra, rb, use_semantic=use_semantic, normalize=normalize)
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio, result,
                                body_lines_a=body_a, body_lines_b=body_b,
                                body_line_numbers_a=nums_a, body_line_numbers_b=nums_b,
                                per_page_lines=per_page, per_page_line_numbers=per_page_nums,
                                file_txn_comparisons=file_txn,
-                               file_section_comparisons=file_sec)
+                               file_section_comparisons=file_sec,
+                               file_csv_comparisons=file_csv,
+                               csv_header_a=csv_hdr_a,
+                               csv_header_b=csv_hdr_b)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
@@ -1888,9 +2121,13 @@ def _write_pair_report(outcome: FilePairOutcome,
         # Re-parse to get full objects for the formatter
         ra = parse_report(str(outcome.file_a), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
         rb = parse_report(str(outcome.file_b), ignore_dates=ignore_dates, ignore_line_patterns=ignore_line_patterns, split_pattern=split_pat, separator_re=sep_re)
+        normalize = remove_dates_from_line if ignore_dates else None
         txn_comps = outcome.file_txn_comparisons if transactions else None
+        csv_comps = outcome.file_csv_comparisons or None
         text = format_report(outcome.result, ra, rb, include_diff=include_diff,
-                             txn_comparisons=txn_comps)
+                             txn_comparisons=txn_comps,
+                             csv_comparisons=csv_comps,
+                             normalize=normalize)
 
     if output_dir:
         # Use file_a's stem as base; append _vs_<file_b_stem> for fuzzy pairs
@@ -2094,14 +2331,16 @@ def main():
     parser.add_argument("--output-dir", "-d",
                         help="[Folder mode] Directory for per-file reports + summary "
                              "(default: print to stdout)")
-    parser.add_argument("--ext", default=".txt",
-                        help="[Folder mode] File extension to include (default: .txt)")
+    parser.add_argument("--ext", action="append", dest="ext", metavar="EXT",
+                        help="File extension to include (default: .txt); may be repeated: --ext .txt --ext .csv")
     parser.add_argument("--fuzzy-match", action="store_true",
                         help="[Folder mode] Also pair files with similar (but not identical) names")
     parser.add_argument("--fuzzy-threshold", type=float, default=0.70,
                         help="[Folder mode] Min name-similarity ratio for fuzzy match (default: 0.70)")
 
     args = parser.parse_args()
+    if not args.ext:
+        args.ext = [".txt"]
 
     split_rules = load_split_config(args.split_config) if args.split_config else None
 
@@ -2138,8 +2377,9 @@ def main():
         print(f"Parsing  : {path_b}", file=sys.stderr)
         report_b = parse_report(str(path_b), ignore_dates=args.ignore_dates, ignore_line_patterns=args.ignore_lines or None, split_pattern=split_pat, separator_re=sep_re)
 
+        normalize = remove_dates_from_line if args.ignore_dates else None
         print("Comparing...", file=sys.stderr)
-        result = compare_reports(report_a, report_b, use_semantic=args.semantic)
+        result = compare_reports(report_a, report_b, use_semantic=args.semantic, normalize=normalize)
 
         def _fm_filter(lines: List[str], nums: List[int]):
             pairs = [(l, n) for l, n in zip(lines, nums) if l.strip()]
@@ -2154,7 +2394,7 @@ def main():
         if args.transactions and sort_re is not None:
             _fm_txns_a = identify_transactions(body_a, nums_a, sort_re, max_txn_ln)
             _fm_txns_b = identify_transactions(body_b, nums_b, sort_re, max_txn_ln)
-            txn_comps = compare_transactions(_fm_txns_a, _fm_txns_b) if (_fm_txns_a or _fm_txns_b) else []
+            txn_comps = compare_transactions(_fm_txns_a, _fm_txns_b, normalize=normalize) if (_fm_txns_a or _fm_txns_b) else []
 
         sep_re = find_separator_pattern(str(path_a), split_rules)
         sec_comps: Optional[List[Dict]] = None
@@ -2163,11 +2403,21 @@ def main():
             txn_nums_b: Set[int] = {n for t in _fm_txns_b for n in t.line_numbers}
             secs_a = extract_summary_sections(body_a, nums_a, txn_nums_a, sep_re)
             secs_b = extract_summary_sections(body_b, nums_b, txn_nums_b, sep_re)
-            sec_comps = compare_summary_sections(secs_a, secs_b) if (secs_a or secs_b) else []
+            sec_comps = compare_summary_sections(secs_a, secs_b, normalize=normalize) if (secs_a or secs_b) else []
+
+        csv_comps: Optional[List[Dict]] = None
+        csv_key_cols = find_csv_key_cols(str(path_a), split_rules)
+        if csv_key_cols is not None:
+            has_hdr = find_csv_has_header(str(path_a), split_rules)
+            _, fm_rows_a = parse_csv_rows(body_a, nums_a, csv_key_cols, has_hdr)
+            _, fm_rows_b = parse_csv_rows(body_b, nums_b, csv_key_cols, has_hdr)
+            csv_comps = compare_csv_rows(fm_rows_a, fm_rows_b, normalize=normalize) if (fm_rows_a or fm_rows_b) else []
 
         output = format_report(result, report_a, report_b,
                                 include_diff=not args.no_diff,
-                                txn_comparisons=txn_comps)
+                                txn_comparisons=txn_comps,
+                                csv_comparisons=csv_comps,
+                                normalize=normalize)
 
         if args.output:
             out_p = Path(args.output)
@@ -2181,6 +2431,10 @@ def main():
                 csv_path = out_p.parent / f"{out_p.stem}_sections.csv"
                 write_section_csv(sec_comps, csv_path)
                 print(f"SEC CSV  → {csv_path}", file=sys.stderr)
+            if csv_comps:
+                csv_path = out_p.parent / f"{out_p.stem}_csv.csv"
+                write_csv_row_csv(csv_comps, csv_path)
+                print(f"CSV ROWS → {csv_path}", file=sys.stderr)
             if args.extract_txn and split_rules:
                 for p, prefix in ((path_a, "A"), (path_b, "B")):
                     extracted = extract_txn_csv_for_file(
