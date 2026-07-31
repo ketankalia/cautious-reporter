@@ -1,6 +1,6 @@
 # Reporter — Usage Guide
 
-Reporter compares structured text reports and produces text summaries, CSV exports, and a self-contained HTML report with interactive diff panels.
+Reporter compares structured text reports and CSV data files, producing text summaries, CSV exports, and a self-contained HTML report with interactive diff panels.
 
 Two tools are available:
 
@@ -40,72 +40,70 @@ Without `--split-config`, the tool uses built-in page-break patterns (form-feed,
 
 | Flag | Effect |
 |------|--------|
+| `--ext EXT` | File extension filter (default `.txt`). **Repeatable** — use `--ext .txt --ext .csv` to scan both extensions in one pass |
+| `--fuzzy-match` | Pair files with similar names when exact name match fails (folder mode) |
+| `--fuzzy-threshold 0.70` | Minimum name similarity for fuzzy pairing (default 0.70) |
 | `--semantic` | Add TF-IDF semantic similarity score (requires scikit-learn) |
-| `--ignore-dates` | Strip date/time patterns before comparing (ISO, US, timestamps) |
+| `--ignore-dates` | Treat date/time differences as equal — original values are still **displayed** but not highlighted in diffs |
 | `--ignore-lines PAT` | Skip lines matching regex PAT (repeatable) |
 | `--no-diff` | Skip unified diff output (text mode only) |
-| `--fuzzy-match` | Pair files with similar names (folder mode) |
-| `--fuzzy-threshold 0.70` | Minimum name similarity for fuzzy pairing (default 0.70) |
-| `--ext .txt` | File extension filter (folder mode, default .txt) |
+| `--split-config PATH` | CSV file mapping filename patterns to parsing rules (see below) |
+| `--transactions` | Enable transaction-level comparison (requires `sort_pattern` in split config) |
+| `--extract-txn` | Export each file's transactions to `<file>_txn_extract.csv` independently of comparison |
 
 ---
 
 ## 3. The Split Config CSV (`--split-config`)
 
-The `--split-config` flag points to a CSV file that tells the tool how to parse specific report types. Each row maps a filename pattern to parsing rules. Files that don't match any row fall back to the default built-in page-break detection.
+The `--split-config` flag points to a CSV file that tells the tool how to parse specific report types and how to perform CSV row matching. Each row maps a filename pattern to parsing rules. Files that don't match any row fall back to default built-in page-break detection.
 
 ### CSV columns
 
 ```csv
-report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
+report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern,csv_key_col,csv_has_header
 ```
 
 | Column | Required | Purpose |
 |--------|----------|---------|
-| `report_pattern` | Yes | Regex matched against the **filename** (not path). First matching row wins. |
-| `split_pattern` | No | Regex applied per line. When the captured value changes, a new page starts. If blank, the built-in page-break patterns are used instead. |
-| `sort_pattern` | No | Regex per line to identify transaction boundaries (enables `--transactions`). |
-| `max_txn_lines` | No | Max lines per transaction block. Prevents non-transaction content (like totals) from being absorbed into the preceding transaction. Leave blank for unlimited. |
-| `separator_pattern` | No | Regex matching full separator lines (e.g. lines of dashes). Enables summary-section extraction between separators. |
+| `report_pattern` | Yes | Python regex matched against the **filename** (not path). First matching row wins. Must be a valid regex — `*.csv` is invalid; use `.*\.csv` |
+| `split_pattern` | No | Regex per line; when the captured value changes, a new page starts. Blank → built-in page-break detection |
+| `sort_pattern` | No | Regex per line identifying transaction boundaries. Enables `--transactions` |
+| `max_txn_lines` | No | Max lines per transaction block. Prevents non-transaction content from being absorbed into the preceding transaction. Blank = unlimited |
+| `separator_pattern` | No | Regex matching full separator lines (e.g. lines of dashes). Enables summary-section extraction |
+| `csv_key_col` | No | 0-based column index (or `"i,j"` for composite key) used to match rows across files. Blank → positional comparison |
+| `csv_has_header` | No | `true` or `false`. If `true`, row 0 is treated as a header (compared separately, excluded from row matching) |
+
+Rows with fewer columns than the header are safe — missing columns default to blank.
 
 ### Example splits.csv
 
 ```csv
-report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
+report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern,csv_key_col,csv_has_header
 invoices.*,^INVOICE NO:\s+(\S+),^DATE:\s+(.+),,
-FERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"[-]{20,}$"
-TOA.*,,,,"\\s*[-]{20,}\\s*$"
+TERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"[-]{20,}$"
+RECAP.*,,,,"\s*[-]{20,}\s*$"
+.*\.csv,,,,,"0",true
 ```
 
 **Row 1 — Invoice files** (`invoices.*`):
-- `split_pattern`: pages split when `INVOICE NO:` value changes (e.g. INV-001 → INV-002)
-- `sort_pattern`: transactions within each page start at lines matching `^DATE:`
-- `max_txn_lines`: blank → unlimited (each transaction runs until the next `^DATE:` match)
-- `separator_pattern`: blank → no summary-section extraction
+- Pages split when `INVOICE NO:` value changes
+- Transactions start at lines matching `^DATE:`
+- No CSV key matching (text file)
 
 **Row 2 — Terminal files** (`TERM.*`):
-- `split_pattern`: pages split on `PAGE N` lines
-- `sort_pattern`: transactions start at lines containing a terminal sequence like `ACCD509B 005000`
-- `max_txn_lines`: `3` — each transaction block is capped at 3 lines, so non-transaction content (TERMINAL TOTALS, COUNTS) is not absorbed into the preceding transaction
-- `separator_pattern`: `[-]{20,}$` — lines of 20+ dashes act as section boundaries. Content between consecutive dash lines becomes a named summary section (TERMINAL TOTALS, TERMINAL COUNTS, CANISTER LEVEL, etc.)
+- Pages split on `PAGE N` lines
+- Transactions start at terminal sequence lines (e.g. `ACCD509B 005000`), capped at 3 lines
+- Lines of 20+ dashes act as section boundaries
 
 **Row 3 — Recap files** (`RECAP.*`):
-- `split_pattern`: blank → built-in page-break detection runs (splits on `PAGE N` header lines)
-- `sort_pattern`: blank → no transaction extraction
-- `separator_pattern`: `\s*[-]{20,}\s*$` — same dash lines, but with `\s*` prefix to handle lines indented by leading spaces
+- Built-in page-break detection (blank split_pattern)
+- Dash separator lines (with optional leading spaces) define summary sections
 
-**Note on quoting:** If a regex contains a comma (e.g. `{20,}`), wrap it in double quotes in the CSV so the comma isn't treated as a column separator.
+**Row 4 — CSV data files** (`.*\.csv`):
+- Column 0 is the match key — rows with the same value in column 0 are paired across files
+- Row 0 is the header (excluded from row matching, shown separately)
 
-### Invalid regex detection
-
-If any regex in splits.csv is syntactically invalid, the tool exits immediately with a clear error before running any comparison:
-
-```
-ERROR: splits.csv row 3: invalid regex in 'separator_pattern': '[-{20'
-       unterminated character set at position 0
-```
-
-The error names the file, row number (1-based, counting the header as row 1), column name, the bad pattern, and the regex engine's description of the problem.
+**Note on quoting:** If a regex contains a comma (e.g. `{20,}`), wrap the field in double quotes so the comma isn't treated as a column separator.
 
 ---
 
@@ -125,27 +123,25 @@ INVOICE NO: INV-002    ← key changed → starts Page 2
   item line ...
 ```
 
-Non-unique keys are handled correctly: if INV-001 appears in two separate blocks, they are grouped into one page (the split fires on the value *transition*, not on each occurrence).
+Non-unique keys are handled correctly: if INV-001 appears in two separate blocks they are grouped into one page (the split fires on the value *transition*, not on each occurrence).
 
-Files that match no CSV row, or rows with a blank `split_pattern`, use the built-in delimiter patterns. The built-in patterns are tried **one at a time in priority order** — the first pattern that splits the file into multiple pages is used and no further patterns run. Priority order (highest first):
+Files that match no CSV row, or rows with a blank `split_pattern`, use the built-in delimiter patterns. The built-in patterns are tried **one at a time in priority order** — the first pattern that splits the file into multiple pages is used. Priority order (highest first):
 
 1. Standalone `PAGE N` line
-2. Any line ending with `PAGE N` (e.g. `SOMDATE 06/02/26 ... PAGE 341`)
+2. Any line ending with `PAGE N` (e.g. `SOMEDATE 06/02/26 ... PAGE 341`)
 3. Form-feed character
 4. `--- Page N ---` / `=== Page N ===`
 5. `Page N of M`
 6. Lines of 10+ dashes or underscores
 7. Lines of 10+ asterisks
 
-This ordering ensures that separator lines (`---`) are only consumed as page breaks if no higher-priority pattern (like `PAGE N`) fires first — preserving them for section extraction.
-
 ---
 
 ## 5. How sort_pattern Works (Transaction Detection)
 
-Requires `--transactions` flag on the command line AND a `sort_pattern` in the matching CSV row. Files with no `sort_pattern` are silently skipped for transaction comparison.
+Requires `--transactions` flag AND a `sort_pattern` in the matching CSV row. Files with no `sort_pattern` are silently skipped.
 
-The `sort_pattern` regex is searched per line across the **entire file body** (not per-page). Every line that matches unconditionally starts a new transaction block, even when the captured value repeats. Each block runs from its match line to the next match line (exclusive).
+The `sort_pattern` regex is searched per line across the **entire file body**. Every matching line unconditionally starts a new transaction block. Each block runs from its match line to the next match line (exclusive).
 
 ```
   ACCD509B 009000    ← sort_pattern matches, starts Transaction 1 (key="009000")
@@ -155,87 +151,121 @@ The `sort_pattern` regex is searched per line across the **entire file body** (n
   ...
 ```
 
-**max_txn_lines** caps each block at N lines from the match. Use this when non-transaction content (SOME TOTALS, COUNTER sections) follows the last transaction without another `sort_pattern` match — without the cap, those lines would be absorbed into the preceding transaction.
+`max_txn_lines` caps each block at N lines. Use this when non-transaction content (totals, counters) follows the last transaction without another sort_pattern match.
 
 ### Transaction comparison
 
-Transactions from file A and file B are matched by their sort key. Same-key duplicates (e.g. two transactions both keyed "0090002") are paired by position within the group (first with first, second with second).
+Transactions from file A and B are matched by sort key. Duplicate keys are paired by position within the group (first with first, second with second).
 
 Results appear in:
-- **HTML report**: `▶ txn` panel per file pair card, with per-transaction diff
-- **CSV auto-export**: `<filename>_txn.csv` alongside the output (columns: sort_key, status, similarity_pct, lines_added, lines_deleted)
+- **HTML report**: `▶ txn` panel per file pair card with per-transaction diff
+- **CSV auto-export**: `<filename>_txn.csv` (columns: sort_key, status, similarity_pct, lines_added, lines_deleted)
 
 ---
 
 ## 6. How separator_pattern Works (Summary Section Extraction)
 
-Requires a `separator_pattern` in the matching CSV row. No command-line flag needed — if the pattern is present, section extraction runs automatically.
+Requires a `separator_pattern` in the matching CSV row. No extra command-line flag needed.
 
-The `separator_pattern` regex identifies full separator lines (e.g. lines of 20+ dashes). Every block of content between consecutive separator lines is extracted as a named summary section. The **first non-blank line** of the block becomes the section name — no special header prefix (like `***`) is required.
+The `separator_pattern` regex identifies full separator lines (e.g. lines of 20+ dashes). Every block of content between consecutive separator lines is extracted as a named summary section. The **first non-blank line** of the block becomes the section name.
 
-
-**Transaction lines are excluded:** If `--transactions` is also active, lines that belong to identified transactions are skipped during section extraction. This prevents card/transaction data from appearing inside summary sections.
-
-**Separator lines always define boundaries**, even if they fall inside a transaction block due to `max_txn_lines` overlap.
+Transaction lines (when `--transactions` is active) are excluded from section content. Separator lines always define boundaries.
 
 ### Section comparison
 
-Sections from file A and file B are matched by normalized name. Normalization strips:
-- Leading `***` (if present)
-- Timestamp prefix (HH:MM:SS, if present)
-- Trailing `(date)` suffix (if present)
-
-So `*** 13:07:03 FINAL TOTALS (06/02)` and `*** 13:08:15 FINAL TOTALS (06/03)` both normalize to `FINAL TOTALS` and are matched. Plain lines without `***` are also normalized (timestamp and date suffix stripping still applies).
+Sections are matched **positionally** — section 1 of A vs section 1 of B, section 2 of A vs section 2 of B, and so on. Extra sections in either file appear as added or removed.
 
 Results appear in:
-- **HTML report**: `▶ sections` panel per file pair card, with `▶ view` (identical) or `▶ diff` (changed) per section
-- **CSV auto-export**: `<filename>_sections.csv` alongside the output (columns: section_name, status, similarity_pct, lines_added, lines_deleted)
+- **HTML report**: `▶ sections` panel per file pair card with per-section diff
+- **CSV auto-export**: `<filename>_sections.csv` (columns: section_name, status, similarity_pct, lines_added, lines_deleted)
 
 ---
 
-## 7. What Happens When You Combine Everything
+## 7. How csv_key_col Works (CSV Row Matching)
+
+Applies to files where the matching split-config row has a `csv_key_col` value. No extra command-line flag needed — but the file must be picked up by `--ext .csv` (or whichever extension matches).
+
+Rows are matched **by key value** rather than by position. This correctly handles CSV files where the same rows appear in different orders in A and B.
+
+```
+A rows (shuffled):          B rows (differently shuffled):
+TXN0045,2026-03-12,...      TXN0101,2026-01-08,...
+TXN0012,2026-01-20,...      TXN0045,2026-03-12,...   ← matched to A row 1
+TXN0101,2026-01-08,...      TXN0012,2026-01-20,...   ← matched to A row 2
+```
+
+**Composite keys** — set `csv_key_col` to a quoted comma-separated list (e.g. `"0,2"`) to match on multiple columns. The key is the pipe-joined concatenation of values in those columns.
+
+**Duplicate keys** — rows sharing the same key are paired by occurrence index within the group (first duplicate with first, second with second).
+
+**Header row** — when `csv_has_header=true`, row 0 is treated as the header. It is shown separately in the HTML panel and excluded from row matching.
+
+### Diff display for CSV files
+
+The main diff panel for a CSV file pair diffs the **key-sorted lines** (not the original file order) so the diff reflects real value changes rather than row-order differences. With `--ignore-dates`, date-valued columns are not highlighted when diffed.
+
+Results appear in:
+- **HTML report**: `▶ csv` panel per file pair card showing matched / added / removed rows with per-row diff
+- **CSV auto-export**: `<filename>_csv.csv` (columns: key, status, similarity_pct, lines_added, lines_deleted)
+
+---
+
+## 8. What Happens When You Combine Everything
 
 Given this splits.csv:
 ```csv
-report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
-TERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"^[-]{20,}\s*$"
+report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern,csv_key_col,csv_has_header
+TERM.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"[-]{20,}$",,
+.*\.csv,,,,,"0",true
 ```
 
 And this command:
 ```powershell
-python html_reporter.py folder_a/ folder_b/ --output results/report.html --split-config splits.csv --transactions
+python html_reporter.py folder_a/ folder_b/ --output results/report.html \
+    --split-config splits.csv --transactions --ext .txt --ext .csv --fuzzy-match --ignore-dates
 ```
 
-For each TERM file pair, the processing pipeline is:
+For each **TERM file pair**, the processing pipeline is:
 
 1. **Page splitting**: file split into pages at `PAGE N` value changes
-2. **Body filtering**: blank lines removed, original line numbers preserved
-3. **Transaction detection** (`--transactions`): `sort_pattern` scanned across whole body; each match starts a new transaction block, capped at 3 lines
-4. **Transaction comparison**: transactions matched A↔B by sort key, diffed
-5. **Section extraction** (`separator_pattern`): body scanned for `---` separator lines; every block between separators (excluding transaction-owned lines) → named summary section (first non-blank line = name)
-6. **Section comparison**: sections matched A↔B by normalized name, diffed
-7. **Full-body diff**: standard line-level diff of the entire body
+2. **Transaction detection**: `sort_pattern` scanned across whole body; each match starts a new block, capped at 3 lines
+3. **Transaction comparison**: transactions matched A↔B by sort key, diffed; date differences suppressed
+4. **Section extraction**: body scanned for `---` separator lines; blocks between separators → named summary sections
+5. **Section comparison**: sections matched A↔B positionally, diffed
+6. **Full-body diff**: standard line-level diff of the entire body
 
-The HTML report card for each file pair shows:
+The HTML report card for each TERM file pair shows:
 - `▶ pages` — per-page comparison with status filters
-- `▶ txn` — transaction-level comparison with per-transaction diff
-- `▶ sections` — summary section comparison (TOTALS, COUNTS, etc.) with per-section view/diff
+- `▶ txn` — transaction comparison with per-transaction diff
+- `▶ sections` — summary section comparison with per-section diff
 - `▶ diff` — full body unified diff with virtual scrolling
 
-Auto-generated alongside the HTML:
+For each **CSV file pair**, the processing pipeline is:
+
+1. **Row parsing**: `csv.reader` parses each row; header separated if `csv_has_header=true`
+2. **Key extraction**: column 0 value used as the match key
+3. **Row matching**: rows grouped by key, paired by occurrence; unmatched rows flagged added/removed
+4. **Row comparison**: matched pairs diffed with per-field token highlighting; date fields suppressed with `--ignore-dates`
+5. **Sorted diff**: diff panel shows both files' lines in key order so value changes are visible without positional noise
+
+The HTML report card for each CSV file pair shows:
+- `▶ csv` — row-level comparison with per-row diff
+- `▶ diff` — full-body diff in key-sorted order
+
+Auto-generated alongside the HTML for each pair:
 - `<file>_txn.csv` — transaction comparison results
 - `<file>_sections.csv` — section comparison results
-- `open_bcompare_<file>.bat` — Beyond Compare launcher
+- `<file>_csv.csv` — CSV row comparison results
 
 ---
 
-## 8. Quick Reference: File Mode
+## 9. Quick Reference: File Mode
 
 ```powershell
 # Basic
 python report_comparator.py fileA.txt fileB.txt --output result.txt
 
-# With split config, transactions, and all features
+# With split config, transactions, and date normalization
 python report_comparator.py fileA.txt fileB.txt --output result.txt \
     --split-config splits.csv --transactions --ignore-dates
 
@@ -248,10 +278,11 @@ Output files (when `--output` is set):
 - `result.txt` — text comparison report
 - `result_txn.csv` — transaction comparison (if `--transactions` + `sort_pattern` match)
 - `result_sections.csv` — section comparison (if `separator_pattern` match)
+- `result_csv.csv` — CSV row comparison (if `csv_key_col` match)
 
 ---
 
-## 9. Quick Reference: Folder Mode (Text)
+## 10. Quick Reference: Folder Mode (Text)
 
 ```powershell
 python report_comparator.py folder_a/ folder_b/ --output-dir results/ \
@@ -266,15 +297,24 @@ Output files per pair in `results/`:
 
 ---
 
-## 10. Quick Reference: Folder Mode (HTML)
+## 11. Quick Reference: Folder Mode (HTML)
 
 ```powershell
+# Text files only (default)
 python html_reporter.py folder_a/ folder_b/ --output results/report.html \
     --split-config splits.csv --transactions --fuzzy-match
+
+# Text + CSV files in one pass
+python html_reporter.py folder_a/ folder_b/ --output results/report.html \
+    --split-config splits.csv --transactions --fuzzy-match --ext .txt --ext .csv
+
+# With date normalization
+python html_reporter.py folder_a/ folder_b/ --output results/report.html \
+    --split-config splits.csv --transactions --ext .txt --ext .csv --ignore-dates
 ```
 
 Output files in `results/`:
-- `report.html` — self-contained interactive report
-- `<file>_txn.csv` per pair
-- `<file>_sections.csv` per pair
-- `open_bcompare_<file>.bat` per pair
+- `report.html` — self-contained interactive report (all CSS/JS embedded, works offline)
+- `<file>_txn.csv` per pair (when transactions enabled)
+- `<file>_sections.csv` per pair (when separator_pattern set)
+- `<file>_csv.csv` per pair (when csv_key_col set)
