@@ -29,7 +29,7 @@ import re
 import sys
 from html import escape
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -43,7 +43,9 @@ from report_comparator import (
     load_split_config, SplitRule,
     write_txn_csv, extract_txn_csv_for_file,
     write_section_csv,
+    write_csv_row_csv,
 )
+from date_utils import remove_dates_from_line
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -147,17 +149,25 @@ def file_link(label: str, url: str, name: str) -> str:
 # Diff rendering
 # ---------------------------------------------------------------------------
 
-def word_diff_inline(old: str, new: str) -> Tuple[str, str]:
+def word_diff_inline(old: str, new: str, normalize=None) -> Tuple[str, str]:
     """
     Return (old_html, new_html) where changed words are wrapped in <mark>
     tags so each row shows exactly which tokens were altered.
 
-    Tokenises on whitespace boundaries so spaces are preserved faithfully.
-    """
-    tok_old = re.split(r'(\s+)', old)
-    tok_new = re.split(r'(\s+)', new)
+    Tokenises on whitespace and common field delimiters (,;|) so individual
+    CSV/delimited fields are highlighted independently.
 
-    sm = difflib.SequenceMatcher(None, tok_old, tok_new, autojunk=False)
+    When normalize is provided (e.g. remove_dates_from_line), SequenceMatcher
+    operates on normalized tokens so date-only token differences are not
+    highlighted — but the original token text is always displayed.
+    """
+    tok_old = re.split(r'(\s+|[,;|])', old)
+    tok_new = re.split(r'(\s+|[,;|])', new)
+
+    cmp_old = [normalize(t) for t in tok_old] if normalize else tok_old
+    cmp_new = [normalize(t) for t in tok_new] if normalize else tok_new
+
+    sm = difflib.SequenceMatcher(None, cmp_old, cmp_new, autojunk=False)
     old_parts: List[str] = []
     new_parts: List[str] = []
 
@@ -181,7 +191,8 @@ def word_diff_inline(old: str, new: str) -> Tuple[str, str]:
 def _diff_rows(lines_a: List[str], lines_b: List[str],
                context: int = 3,
                line_nums_a: Optional[List[int]] = None,
-               line_nums_b: Optional[List[int]] = None) -> list:
+               line_nums_b: Optional[List[int]] = None,
+               normalize=None) -> list:
     """
     Compute diff opcodes and return a compact, JSON-serialisable row list.
 
@@ -191,7 +202,7 @@ def _diff_rows(lines_a: List[str], lines_b: List[str],
       [2, lnb, html]               — inserted line
       [3, count]                   — collapsed skip marker
     """
-    opcodes = diff_opcodes(lines_a, lines_b)
+    opcodes = diff_opcodes(lines_a, lines_b, normalize=normalize)
     rows: list = []
 
     def lna(i: int) -> int: return line_nums_a[i] if line_nums_a else i + 1
@@ -220,7 +231,7 @@ def _diff_rows(lines_a: List[str], lines_b: List[str],
             ins_lines = lines_b[j1:j2]
             if len(del_lines) == len(ins_lines):
                 for k, (old, new) in enumerate(zip(del_lines, ins_lines)):
-                    old_html, new_html = word_diff_inline(old, new)
+                    old_html, new_html = word_diff_inline(old, new, normalize=normalize)
                     rows.append([1, lna(i1+k), old_html])
                     rows.append([2, lnb(j1+k), new_html])
             else:
@@ -255,7 +266,8 @@ def _pages_tag(panel_id: str, data: dict) -> str:
 def build_diff_html(lines_a: List[str], lines_b: List[str],
                     context: int = 3,
                     line_nums_a: Optional[List[int]] = None,
-                    line_nums_b: Optional[List[int]] = None) -> str:
+                    line_nums_b: Optional[List[int]] = None,
+                    normalize=None) -> str:
     """
     Build a unified-style HTML diff table (eager rendering).
 
@@ -263,7 +275,7 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
     The HTML reporter uses _diff_rows() + _diff_tag() for deferred rendering.
     """
     html_rows: List[str] = []
-    for row in _diff_rows(lines_a, lines_b, context, line_nums_a, line_nums_b):
+    for row in _diff_rows(lines_a, lines_b, context, line_nums_a, line_nums_b, normalize=normalize):
         t = row[0]
         if t == 0:
             html_rows.append(
@@ -348,7 +360,8 @@ def sections_table(sections: List[dict]) -> str:
 def pages_panel(page_comparisons: List[dict],
                 per_page_lines: List[Tuple[List[str], List[str]]],
                 panel_id: str,
-                per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None) -> Tuple[str, str]:
+                per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None,
+                normalize=None) -> Tuple[str, str]:
     """Return (toggle_html, panel_html) for per-page comparison.
     Returns ('', '') when there is nothing to show (single-page files).
     Table content is deferred: stored as JSON in a <script> tag, built by
@@ -397,7 +410,7 @@ def pages_panel(page_comparisons: List[dict],
                 else:
                     la_nums, lb_nums = None, None
                 script_tags.append(
-                    _diff_tag(diff_pid, _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums))
+                    _diff_tag(diff_pid, _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums, normalize=normalize))
                 )
                 diff_id = diff_pid
 
@@ -437,7 +450,9 @@ def pair_card(outcome: FilePairOutcome,
               body_lines_b: List[str],
               per_page_lines: Optional[List[Tuple[List[str], List[str]]]] = None,
               file_txn_comparisons: Optional[List[dict]] = None,
-              file_section_comparisons: Optional[List[dict]] = None) -> str:
+              file_section_comparisons: Optional[List[dict]] = None,
+              file_csv_comparisons: Optional[List[dict]] = None,
+              normalize=None) -> str:
 
     if outcome.error:
         return (
@@ -498,17 +513,44 @@ def pair_card(outcome: FilePairOutcome,
                 eff_pcs.append({"status": "added", "page_num_a": None,
                                 "page_num_b": pnum_b, "lines": sec["lines"]})
 
-    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln)
+    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln, normalize=normalize)
 
     # Build the diff panel (only when there are differences)
-    if ratio < 1.0 and (body_lines_a or body_lines_b):
-        _rows = _diff_rows(body_lines_a, body_lines_b,
-                           line_nums_a=outcome.body_line_numbers_a or None,
-                           line_nums_b=outcome.body_line_numbers_b or None)
+    # When CSV mode is active, diff the key-sorted lines so the diff reflects
+    # real value changes rather than row-order differences.
+    if file_csv_comparisons is not None:
+        diff_lines_a: List[str] = []
+        diff_lines_b: List[str] = []
+        if outcome.csv_header_a:
+            diff_lines_a.append(",".join(outcome.csv_header_a))
+        if outcome.csv_header_b:
+            diff_lines_b.append(",".join(outcome.csv_header_b))
+        for rc in file_csv_comparisons:
+            if rc["status"] == "matched":
+                diff_lines_a.append(rc["row_a"].line)
+                diff_lines_b.append(rc["row_b"].line)
+            elif rc["status"] == "removed":
+                diff_lines_a.append(rc["row_a"].line)
+            else:
+                diff_lines_b.append(rc["row_b"].line)
+        diff_lna = diff_lnb = None  # line numbers not meaningful after sort
+        diff_label = "Inline diff — CSV rows sorted by key (headers &amp; footers excluded)"
+    else:
+        diff_lines_a = body_lines_a
+        diff_lines_b = body_lines_b
+        diff_lna = outcome.body_line_numbers_a or None
+        diff_lnb = outcome.body_line_numbers_b or None
+        diff_label = "Inline diff — body content (headers &amp; footers excluded)"
+
+    if ratio < 1.0 and (diff_lines_a or diff_lines_b):
+        _rows = _diff_rows(diff_lines_a, diff_lines_b,
+                           line_nums_a=diff_lna,
+                           line_nums_b=diff_lnb,
+                           normalize=normalize)
         diff_panel = (
             f'<div class="diff-outer" id="{diff_id}">'
             f'<div class="diff-toolbar">'
-            f'  <span>Inline diff — body content (headers &amp; footers excluded)</span>'
+            f'  <span>{diff_label}</span>'
             f'  <span class="diff-legend">'
             f'    <span class="dl-del">− removed</span>'
             f'    <span class="dl-chg">~ changed word</span>'
@@ -545,7 +587,7 @@ def pair_card(outcome: FilePairOutcome,
                     tna = tc["txn_a"].line_numbers or None
                     tnb = tc["txn_b"].line_numbers or None
                     txn_script_tags.append(
-                        _diff_tag(txn_did, _diff_rows(tla, tlb, line_nums_a=tna, line_nums_b=tnb))
+                        _diff_tag(txn_did, _diff_rows(tla, tlb, line_nums_a=tna, line_nums_b=tnb, normalize=normalize))
                     )
                     txn_diff_id = txn_did
                 txn_entries.append([0, key, tr2, ta, td2, txn_diff_id])
@@ -584,7 +626,7 @@ def pair_card(outcome: FilePairOutcome,
                 sd  = d["lines_deleted"]
                 sdid = f"{sec_id}-s{si}"
                 sec_script_tags.append(
-                    _diff_tag(sdid, _diff_rows(sc["lines_a"], sc["lines_b"]))
+                    _diff_tag(sdid, _diff_rows(sc["lines_a"], sc["lines_b"], normalize=normalize))
                 )
                 name_b = sc.get("name_b", sc["name"])
                 name_display = sc["name"] if name_b == sc["name"] else f'{sc["name"]} → {name_b}'
@@ -610,6 +652,51 @@ def pair_card(outcome: FilePairOutcome,
         )
         sec_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{sec_id}\')">▶ sections</span>'
 
+    # Build the CSV records panel
+    csv_toggle = ''
+    csv_panel  = ''
+    if file_csv_comparisons:
+        csv_id = f"csv-{card_id}"
+        csv_script_tags: List[str] = []
+        csv_entries: list = []
+        for ci, rc in enumerate(file_csv_comparisons):
+            key = rc["key"]
+            if rc["status"] == "matched":
+                cr = rc["diff"]["similarity_ratio"]
+                ca = rc["diff"]["lines_added"]
+                cd = rc["diff"]["lines_deleted"]
+                csv_did = None
+                if cr < 1.0:
+                    did = f"{csv_id}-r{ci}"
+                    rla = [rc["row_a"].line]
+                    rlb = [rc["row_b"].line]
+                    rna = [rc["row_a"].line_number]
+                    rnb = [rc["row_b"].line_number]
+                    csv_script_tags.append(
+                        _diff_tag(did, _diff_rows(rla, rlb, line_nums_a=rna, line_nums_b=rnb, normalize=normalize))
+                    )
+                    csv_did = did
+                csv_entries.append([0, key, cr, ca, cd, csv_did])
+            elif rc["status"] == "added":
+                csv_entries.append([1, key])
+            else:
+                csv_entries.append([2, key])
+
+        n_m = sum(1 for r in file_csv_comparisons if r["status"] == "matched")
+        n_a = sum(1 for r in file_csv_comparisons if r["status"] == "added")
+        n_r = sum(1 for r in file_csv_comparisons if r["status"] == "removed")
+        csv_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r},
+                    "rows": csv_entries}
+        csv_data_tag = (f'<script type="application/json" id="{csv_id}-data">'
+                        f'{_json.dumps(csv_data, separators=(",",":"))}</script>')
+        csv_panel = (
+            f'<div class="sec-detail" id="{csv_id}" data-csv-src="{csv_id}-data">'
+            + ''.join(csv_script_tags)
+            + csv_data_tag
+            + '</div>'
+        )
+        csv_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{csv_id}\')">▶ csv</span>'
+
     html = f"""
 <div class="card {v_css}" id="{card_id}" data-verdict="{v_css}">
 
@@ -620,6 +707,7 @@ def pair_card(outcome: FilePairOutcome,
     {pages_toggle}
     {txn_toggle}
     {sec_toggle}
+    {csv_toggle}
     {diff_toggle}
   </div>
 
@@ -652,6 +740,8 @@ def pair_card(outcome: FilePairOutcome,
   {txn_panel}
 
   {sec_panel}
+
+  {csv_panel}
 
   {diff_panel}
 
@@ -1048,6 +1138,44 @@ function renderSectionsPanel(el,srcId){
   el.appendChild(wrap);
   el.dataset.rendered='1';
 }
+function renderCsvPanel(el,srcId){
+  if(el.dataset.rendered)return;
+  let d=el._csvData;
+  if(!d){
+    const script=document.getElementById(srcId);
+    if(!script)return;
+    d=JSON.parse(script.textContent);
+    el._csvData=d;
+    script.remove();
+  }
+  const s=d.summary;
+  let hdr=`<div class="txn-summary">CSV rows: <strong>${s.matched}</strong> matched`;
+  if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
+  if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
+  hdr+='</div>';
+  let tb='';
+  for(const r of d.rows){
+    if(r[0]===0){
+      const[,key,ratio,add,ndel,did]=r;
+      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+      const sim=(ratio*100).toFixed(1)+'%';
+      const chg=`+${add} −${ndel}`;
+      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
+      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Row: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
+    }else if(r[0]===1){
+      tb+=`<tr class="s-added"><td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">—</td><td></td></tr>`;
+    }else{
+      tb+=`<tr class="s-removed"><td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">—</td><td></td></tr>`;
+    }
+  }
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
+  el.appendChild(wrap);
+  el.dataset.rendered='1';
+}
 function renderPages(el){
   if(el.dataset.rendered)return;
   let d=el._pagesData;
@@ -1107,6 +1235,7 @@ async function toggle(btn,id){
     if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
     else if(el.dataset.txnSrc&&!el.dataset.rendered)renderTxnPanel(el,el.dataset.txnSrc);
     else if(el.dataset.secSrc&&!el.dataset.rendered)renderSectionsPanel(el,el.dataset.secSrc);
+    else if(el.dataset.csvSrc&&!el.dataset.rendered)renderCsvPanel(el,el.dataset.csvSrc);
     else{
       const target=el.dataset.diffSrc?el:el.querySelector('[data-diff-src]');
       if(target&&!target.dataset.rendered)await renderDiff(target);
@@ -1257,7 +1386,7 @@ def build_html(folder_a: Path, folder_b: Path,
 
 def run(folder_a: Path, folder_b: Path,
         output: Path,
-        ext: str,
+        ext: Union[str, List[str]],
         fuzzy: bool,
         fuzzy_threshold: float,
         use_semantic: bool,
@@ -1332,11 +1461,19 @@ def run(folder_a: Path, folder_b: Path,
             write_section_csv(outcome.file_section_comparisons, csv_path)
             print(f"  SEC CSV → {csv_path}", file=sys.stderr)
 
+        if outcome.file_csv_comparisons:
+            csv_path = output.parent / f"{stem}_csv.csv"
+            write_csv_row_csv(outcome.file_csv_comparisons, csv_path)
+            print(f"  CSV ROWS → {csv_path}", file=sys.stderr)
+
         card_id = f"card-{i}"
+        normalize = remove_dates_from_line if ignore_dates else None
         cards_html += pair_card(outcome, url_a, url_b, card_id,
                                  body_a, body_b, per_page_lines,
                                  file_txn_comparisons=outcome.file_txn_comparisons or None,
-                                 file_section_comparisons=outcome.file_section_comparisons or None)
+                                 file_section_comparisons=outcome.file_section_comparisons or None,
+                                 file_csv_comparisons=outcome.file_csv_comparisons or None,
+                                 normalize=normalize)
 
     unmatched_html = unmatched_section(match.only_in_a, match.only_in_b,
                                         linux_base, windows_base)
@@ -1360,8 +1497,8 @@ def main():
     p.add_argument("folder_b", help="Comparison folder")
     p.add_argument("--output", "-o", default="results/comparison_report.html",
                    help="Output HTML file (default: results/comparison_report.html)")
-    p.add_argument("--ext", default=".txt",
-                   help="File extension to compare (default: .txt)")
+    p.add_argument("--ext", action="append", dest="ext", metavar="EXT",
+                   help="File extension to compare (default: .txt); may be repeated: --ext .txt --ext .csv")
     p.add_argument("--fuzzy-match", action="store_true",
                    help="Pair files with similar (but not identical) names")
     p.add_argument("--fuzzy-threshold", type=float, default=0.70,
@@ -1389,6 +1526,8 @@ def main():
                         "Independent of --transactions; requires --split-config.")
 
     args = p.parse_args()
+    if not args.ext:
+        args.ext = [".txt"]
 
     run(
         folder_a       = Path(args.folder_a),
