@@ -1,3 +1,5 @@
-report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern
+report_pattern,split_pattern,sort_pattern,max_txn_lines,separator_pattern,csv_key_col,csv_has_header
 invoices.*,^INVOICE NO:\s+(\S+),^DATE:\s+(.+),,
-TERM.*,PAGE\s+(\d+),FOO[A-Z0-9]+\s(\d+),3,"^[-]{20,}\s*$"
+TER.*,PAGE\s+(\d+),FN[A-Z0-9]+\s(\d+),3,"[-]{20,}$"
+REC.*,,,,"\s*[-]{20,}\s*$"
+.*\.csv,,,,,"0",
