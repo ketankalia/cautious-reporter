@@ -129,7 +129,7 @@ class SplitRule:
     sort_re: Optional[re.Pattern] = None
     max_txn_lines: Optional[int] = None
     separator_re: Optional[re.Pattern] = None
-    csv_key_cols: Optional[List[int]] = None   # 0-based column indices forming the composite match key
+    csv_key_cols: Optional[List[Tuple[int, Optional[int]]]] = None  # (start, length) slices; length=None → read to next comma
     csv_has_header: bool = False
 
 
@@ -139,7 +139,7 @@ def load_split_config(csv_path: str) -> List["SplitRule"]:
     Columns: report_pattern, split_pattern, sort_pattern, max_txn_lines,
              separator_pattern, csv_key_col, csv_has_header
     All columns after report_pattern are optional.
-    csv_key_col accepts a single index (e.g. 0) or comma-separated indices (e.g. "0,2").
+    csv_key_col accepts position:length slices (e.g. "5:8" or "5:8,20:6" for composite).
     """
     def _compile(pattern: str, column: str, row_num: int) -> re.Pattern:
         try:
@@ -161,10 +161,70 @@ def load_split_config(csv_path: str) -> List["SplitRule"]:
             sep_pat     = (row.get("separator_pattern") or "").strip()
             key_col_raw = (row.get("csv_key_col") or "").strip()
             has_hdr_raw = (row.get("csv_has_header") or "").strip().lower()
-            csv_key_cols = (
-                [int(x.strip()) for x in key_col_raw.split(",")]
-                if key_col_raw else None
-            )
+            if key_col_raw:
+                csv_key_cols = []
+                for part in key_col_raw.split(","):
+                    part = part.strip()
+                    if ":" in part:
+                        pos_s, len_s = part.split(":", 1)
+                        len_s = len_s.strip()
+                        if not len_s:
+                            # "27:" — colon present but no length → read to next comma
+                            try:
+                                pos_v = int(pos_s.strip())
+                            except ValueError:
+                                print(
+                                    f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                    f"— pos must be an integer.",
+                                    file=sys.stderr,
+                                )
+                                sys.exit(1)
+                            if pos_v < 1:
+                                print(
+                                    f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                    f"— pos must be >= 1 (1-based).",
+                                    file=sys.stderr,
+                                )
+                                sys.exit(1)
+                            csv_key_cols.append((pos_v - 1, None))
+                        else:
+                            try:
+                                pos_v, len_v = int(pos_s.strip()), int(len_s)
+                            except ValueError:
+                                print(
+                                    f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                    f"— pos and length must be integers.",
+                                    file=sys.stderr,
+                                )
+                                sys.exit(1)
+                            if pos_v < 1 or len_v <= 0:
+                                print(
+                                    f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                    f"— pos must be >= 1 (1-based) and length must be > 0.",
+                                    file=sys.stderr,
+                                )
+                                sys.exit(1)
+                            csv_key_cols.append((pos_v - 1, len_v))
+                    else:
+                        try:
+                            pos_v = int(part)
+                        except ValueError:
+                            print(
+                                f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                f"— pos must be an integer.",
+                                file=sys.stderr,
+                            )
+                            sys.exit(1)
+                        if pos_v < 1:
+                            print(
+                                f"ERROR: {csv_path} row {row_num}: csv_key_col {part!r} "
+                                f"— pos must be >= 1 (1-based).",
+                                file=sys.stderr,
+                            )
+                            sys.exit(1)
+                        csv_key_cols.append((pos_v - 1, None))
+            else:
+                csv_key_cols = None
             rules.append(SplitRule(
                 report_re=_compile(row["report_pattern"], "report_pattern", row_num),
                 split_re=_compile(split_pat, "split_pattern", row_num) if split_pat else None,
@@ -226,7 +286,7 @@ def find_separator_pattern(filename: str,
 
 
 def find_csv_key_cols(filename: str,
-                      rules: Optional[List["SplitRule"]]) -> Optional[List[int]]:
+                      rules: Optional[List["SplitRule"]]) -> Optional[List[Tuple[int, Optional[int]]]]:
     """Return csv_key_cols for the first matching rule, else None."""
     if not rules:
         return None
@@ -1226,7 +1286,7 @@ def write_txn_csv(file_txn_comparisons: List[Dict], csv_path: Path) -> None:
 def parse_csv_rows(
     body_lines: List[str],
     body_nums: List[int],
-    csv_key_cols: List[int],
+    csv_key_cols: List[Tuple[int, Optional[int]]],
     has_header: bool,
 ) -> tuple:
     """Parse body lines as CSV and return (header_fields_or_None, list_of_CsvRow).
@@ -1234,6 +1294,8 @@ def parse_csv_rows(
     Uses csv.reader so quoted commas inside fields are handled correctly.
     When has_header=True the first non-empty line is treated as the header row
     and returned as a List[str]; it is excluded from the returned CsvRow list.
+
+    csv_key_cols is a list of (start, length) tuples applied to the raw line.
     """
     import io as _io
 
@@ -1254,8 +1316,12 @@ def parse_csv_rows(
 
         key_parts: List[str] = []
         sort_parts: List[object] = []
-        for col in csv_key_cols:
-            val = fields[col].strip() if col < len(fields) else ""
+        for pos, length in csv_key_cols:
+            if length is None:
+                comma = line.find(",", pos)
+                val = line[pos : comma if comma != -1 else len(line)].strip()
+            else:
+                val = line[pos : pos + length].strip()
             key_parts.append(val)
             sort_parts.append(_parse_sort_val(val))
 
