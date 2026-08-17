@@ -45,7 +45,7 @@ from report_comparator import (
     write_section_csv,
     write_csv_row_csv,
 )
-from date_utils import remove_dates_from_line
+from date_utils import remove_dates_from_line, has_dates
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -164,8 +164,14 @@ def word_diff_inline(old: str, new: str, normalize=None) -> Tuple[str, str]:
     tok_old = re.split(r'(\s+|[,;|])', old)
     tok_new = re.split(r'(\s+|[,;|])', new)
 
-    cmp_old = [normalize(t) for t in tok_old] if normalize else tok_old
-    cmp_new = [normalize(t) for t in tok_new] if normalize else tok_new
+    # Gate normalize behind has_dates: re.search short-circuits immediately for
+    # tokens with no date patterns, avoiding 200× re.sub calls per line.
+    if normalize:
+        cmp_old = [normalize(t) if has_dates(t) else t for t in tok_old]
+        cmp_new = [normalize(t) if has_dates(t) else t for t in tok_new]
+    else:
+        cmp_old = tok_old
+        cmp_new = tok_new
 
     sm = difflib.SequenceMatcher(None, cmp_old, cmp_new, autojunk=False)
     old_parts: List[str] = []
