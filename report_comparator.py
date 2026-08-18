@@ -313,19 +313,46 @@ def find_csv_has_header(filename: str,
 # 1.  PAGE SPLITTER
 # ---------------------------------------------------------------------------
 
-# Common page-break patterns in text reports
+# Common page-break patterns in text reports (applied per-line, no re.MULTILINE).
+# Pattern 2 was r'^.*\bPAGE\s+\d+\s*$' with MULTILINE — the ^.* caused O(n²)
+# backtracking on long lines (e.g. 5 KB CSV rows). Using \bPAGE\s+\d+\s*$ with
+# re.search on each line is semantically equivalent and avoids the backtracking.
 _PAGE_BREAK_PATTERNS = [
-    r'^\s*PAGE\s+\d+\s*$',                             # PAGE 1 / PAGE  2
-    r'^.*\bPAGE\s+\d+\s*$',                            # any content ... PAGE N (e.g. SETDATE 06/02/26 ... PAGE 341)
-    r'\f',                                          # form-feed character
-    r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',           # --- Page 3 ---
-    r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',            # === Page 3 ===
-    r'^\s*[Pp]age\s+\d+\s+of\s+\d+\s*$',           # Page 3 of 10
-    r'^[-_]{10,}\s*$',                               # ──────────────  (must start at col 0)
-    r'^\*{10,}\s*$',                                 # ************   (must start at col 0)
+    r'^\s*PAGE\s+\d+\s*$',           # PAGE 1 / PAGE  2
+    r'\bPAGE\s+\d+\s*$',             # any content ... PAGE N at line end
+    r'^-{3,}\s*[Pp]age\s*\d+\s*-{3,}$',  # --- Page 3 ---
+    r'^={3,}\s*[Pp]age\s*\d+\s*={3,}$',  # === Page 3 ===
+    r'^\s*[Pp]age\s+\d+\s+of\s+\d+\s*$', # Page 3 of 10
+    r'^[-_]{10,}\s*$',               # ──────────────
+    r'^\*{10,}\s*$',                 # ************
 ]
 
-_PAGE_BREAK_RES = [re.compile(p, re.MULTILINE) for p in _PAGE_BREAK_PATTERNS]
+# Compiled without MULTILINE — applied via re.search to each line individually.
+_PAGE_BREAK_RES = [re.compile(p) for p in _PAGE_BREAK_PATTERNS]
+
+# Per-pattern maximum line length. The unanchored pattern (index 1) must scan
+# every character of every line — on 5 KB CSV rows that's O(n²). Page headers
+# are always short; a 250-char cap eliminates the bottleneck with no false negatives.
+_PAGE_BREAK_MAXLEN: List[Optional[int]] = [
+    None,  # ^\s*PAGE\s+\d+\s*$        anchored, fast at any line length
+    250,   # \bPAGE\s+\d+\s*$          unanchored — skip long data lines
+    None,  # ^-{3,}\s*[Pp]age...       anchored
+    None,  # ^={3,}\s*[Pp]age...       anchored
+    None,  # ^\s*[Pp]age\s+\d+\s+of   anchored
+    None,  # ^[-_]{10,}\s*$            anchored
+    None,  # ^\*{10,}\s*$              anchored
+]
+
+# Fast pre-screen substrings: if none are present in text, no pattern can match.
+# Checked with Python's built-in `in` (Boyer-Moore), far cheaper than 7 regex passes.
+_PAGE_BREAK_TRIGGERS = [
+    ('PAGE', 0),   # patterns 0-4 (PAGE / Page keyword)
+    ('Page', 0),
+    ('page', 4),   # pattern 4 only: "page N of M"
+    ('----------', 5),  # pattern 5: 10+ dashes
+    ('__________', 5),  # pattern 5: 10+ underscores
+    ('**********', 6),  # pattern 6: 10+ asterisks
+]
 
 
 def _split_by_value_change(text: str, pattern: re.Pattern) -> List[List[str]]:
@@ -371,31 +398,63 @@ def split_into_pages(text: str,
     if split_pattern is not None:
         return _split_by_value_change(text, split_pattern)
 
-    # Normalise line endings
     text = text.replace("\r\n", "\n").replace("\r", "\n")
 
-    def _chunks_to_pages(chunks: List[str]) -> List[List[str]]:
-        out = []
-        for chunk in chunks:
-            lines = chunk.split("\n")
-            while lines and not lines[0].strip():
-                lines.pop(0)
-            while lines and not lines[-1].strip():
-                lines.pop()
-            if lines:
-                out.append(lines)
-        return out
+    def _pages_from_break_indices(lines: List[str], break_idxs: List[int]) -> List[List[str]]:
+        """Build page list by treating lines at break_idxs as separators (excluded)."""
+        pages: List[List[str]] = []
+        prev = 0
+        for idx in break_idxs:
+            chunk = lines[prev:idx]
+            while chunk and not chunk[0].strip():  chunk = chunk[1:]
+            while chunk and not chunk[-1].strip(): chunk = chunk[:-1]
+            if chunk: pages.append(chunk)
+            prev = idx + 1
+        chunk = lines[prev:]
+        while chunk and not chunk[0].strip():  chunk = chunk[1:]
+        while chunk and not chunk[-1].strip(): chunk = chunk[:-1]
+        if chunk: pages.append(chunk)
+        return pages
 
-    # Try each page-break pattern in order; stop at the first that splits the file
-    for pat in _PAGE_BREAK_RES:
-        chunks = pat.split(text)
-        if len(chunks) > 1:
-            pages = _chunks_to_pages(chunks)
-            if pages:
+    # Form-feed: single character, no backtracking risk — keep as full-text split
+    if '\f' in text:
+        chunks = text.split('\f')
+        lines_per_chunk = []
+        for chunk in chunks:
+            chunk_lines = chunk.split("\n")
+            while chunk_lines and not chunk_lines[0].strip():  chunk_lines = chunk_lines[1:]
+            while chunk_lines and not chunk_lines[-1].strip(): chunk_lines = chunk_lines[:-1]
+            if chunk_lines: lines_per_chunk.append(chunk_lines)
+        if len(lines_per_chunk) > 1:
+            return lines_per_chunk
+
+    # Pre-screen: find the lowest pattern index that could possibly match based
+    # on fast substring checks — skips N × 7 regex passes for plain CSV/text files.
+    first_pat = len(_PAGE_BREAK_RES)  # sentinel = no patterns needed
+    for needle, pat_idx in _PAGE_BREAK_TRIGGERS:
+        if pat_idx < first_pat and needle in text:
+            first_pat = pat_idx
+            if first_pat == 0:
+                break  # can't go lower
+
+    if first_pat == len(_PAGE_BREAK_RES):
+        return [text.split("\n")]
+
+    # Scan line by line for matching patterns — avoids O(n²) backtracking that
+    # full-text re.split(multiline_pat, 100MB_text) causes on long CSV lines.
+    lines = text.split("\n")
+    for pat, maxlen in zip(_PAGE_BREAK_RES[first_pat:], _PAGE_BREAK_MAXLEN[first_pat:]):
+        if maxlen is None:
+            break_idxs = [i for i, ln in enumerate(lines) if pat.search(ln)]
+        else:
+            break_idxs = [i for i, ln in enumerate(lines)
+                          if len(ln) <= maxlen and pat.search(ln)]
+        if break_idxs:
+            pages = _pages_from_break_indices(lines, break_idxs)
+            if len(pages) > 1:
                 return pages
 
-    # Fallback: no page breaks found — whole file is one page
-    return [text.split("\n")]
+    return [lines]
 
 
 # ---------------------------------------------------------------------------
@@ -1067,16 +1126,29 @@ _SORT_DT_FORMATS = (
     "%m/%d/%Y", "%d/%m/%Y",
     "%d-%b-%Y", "%b %d, %Y", "%B %d, %Y",
 )
+# Formats that contain '-' or '/' as separator (fast pre-screen: skip if neither present)
+_SORT_DT_FORMATS_SEP = tuple(f for f in _SORT_DT_FORMATS if '-' in f or '/' in f)
+# Formats using month names (require a space; checked only for short strings with spaces)
+_SORT_DT_FORMATS_MON = tuple(f for f in _SORT_DT_FORMATS if '-' not in f and '/' not in f)
 
 
 def _parse_sort_val(raw: str) -> object:
     """Parse a sort-key string → datetime | float | str for ordering."""
     s = raw.strip()
-    for fmt in _SORT_DT_FORMATS:
-        try:
-            return _dt.strptime(s, fmt)
-        except ValueError:
-            pass
+    # Skip strptime trials when the string clearly isn't a date — avoids 9 exception
+    # raises per row for numeric/string keys in large CSV files (~2.9s for 20K rows).
+    if '-' in s or '/' in s:
+        for fmt in _SORT_DT_FORMATS_SEP:
+            try:
+                return _dt.strptime(s, fmt)
+            except ValueError:
+                pass
+    elif ' ' in s and len(s) <= 30:
+        for fmt in _SORT_DT_FORMATS_MON:
+            try:
+                return _dt.strptime(s, fmt)
+            except ValueError:
+                pass
     try:
         return float(s.replace(",", ""))
     except ValueError:
@@ -1291,9 +1363,10 @@ def parse_csv_rows(
 ) -> tuple:
     """Parse body lines as CSV and return (header_fields_or_None, list_of_CsvRow).
 
-    Uses csv.reader so quoted commas inside fields are handled correctly.
     When has_header=True the first non-empty line is treated as the header row
-    and returned as a List[str]; it is excluded from the returned CsvRow list.
+    and parsed via csv.reader (handles quoted fields); it is excluded from CsvRow list.
+    Data rows skip csv.reader entirely — CsvRow.fields is unused downstream and
+    csv.reader(io.StringIO(line)) is ~17x slower than a direct char-slice key extract.
 
     csv_key_cols is a list of (start, length) tuples applied to the raw line.
     """
@@ -1301,17 +1374,18 @@ def parse_csv_rows(
 
     header_fields: Optional[List[str]] = None
     rows: List[CsvRow] = []
+    header_done = not has_header  # if no header expected, skip the header check
 
     for line, num in zip(body_lines, body_nums):
         if not line.strip():
             continue
-        try:
-            fields = next(csv.reader(_io.StringIO(line)))
-        except Exception:
-            fields = [line]
 
-        if has_header and header_fields is None:
-            header_fields = fields
+        if not header_done:
+            try:
+                header_fields = next(csv.reader(_io.StringIO(line)))
+            except Exception:
+                header_fields = [line]
+            header_done = True
             continue
 
         key_parts: List[str] = []
@@ -1328,7 +1402,7 @@ def parse_csv_rows(
         rows.append(CsvRow(
             key="|".join(key_parts),
             sort_val=tuple(sort_parts),
-            fields=fields,
+            fields=[],
             line=line,
             line_number=num,
         ))
@@ -1372,7 +1446,18 @@ def compare_csv_rows(
         bs_ = groups_b.get(key, [])
         for i in range(max(len(as_), len(bs_))):
             if i < len(as_) and i < len(bs_):
-                diff = line_diff_stats([as_[i].line], [bs_[i].line], normalize=normalize)
+                # Fast O(1) path for single-row comparison: avoids 40K pandas
+                # Series/value_counts calls (line_diff_stats overhead) for large CSV files.
+                # For a single-line input, multiset similarity is always 0.0 or 1.0.
+                la, lb = as_[i].line, bs_[i].line
+                cmp_la = normalize(la) if normalize else la
+                cmp_lb = normalize(lb) if normalize else lb
+                if cmp_la == cmp_lb:
+                    diff = {"lines_added": 0, "lines_deleted": 0, "lines_common": 1,
+                            "similarity_ratio": 1.0, "change_pct": 0.0}
+                else:
+                    diff = {"lines_added": 1, "lines_deleted": 1, "lines_common": 0,
+                            "similarity_ratio": 0.0, "change_pct": 200.0}
                 results.append({
                     "status": "matched",
                     "key":    key,
