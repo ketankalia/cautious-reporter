@@ -43,11 +43,14 @@ _DATE_TIME_PATTERNS = [
     r'\d{4}[-/]\d{2}[-/]\d{2}\s*[-–—]\s*\d{4}[-/]\d{2}[-/]\d{2}',
 ]
 
-# Compile patterns into a single regex with alternation
+# Compile patterns into a single regex with alternation.
+# No outer capturing groups — we only need substitution, not capture.
 _DATE_TIME_RE = re.compile(
-    "|".join(f"({pattern})" for pattern in _DATE_TIME_PATTERNS),
+    "|".join(_DATE_TIME_PATTERNS),
     re.IGNORECASE
 )
+
+_MULTI_SPACE_RE = re.compile(r' {2,}')
 
 
 def remove_dates_from_line(line: str) -> str:
@@ -67,7 +70,7 @@ def remove_dates_from_line(line: str) -> str:
     result = _DATE_TIME_RE.sub("", line)
     
     # Clean up multiple consecutive spaces
-    result = re.sub(r' {2,}', ' ', result)
+    result = _MULTI_SPACE_RE.sub(' ', result)
     
     # Strip leading/trailing whitespace
     result = result.strip()
