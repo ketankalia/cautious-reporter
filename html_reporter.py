@@ -45,7 +45,7 @@ from report_comparator import (
     write_section_csv,
     write_csv_row_csv,
 )
-from date_utils import remove_dates_from_line
+from date_utils import remove_dates_from_line, has_dates
 
 # ---------------------------------------------------------------------------
 # Path helpers
@@ -164,10 +164,20 @@ def word_diff_inline(old: str, new: str, normalize=None) -> Tuple[str, str]:
     tok_old = re.split(r'(\s+|[,;|])', old)
     tok_new = re.split(r'(\s+|[,;|])', new)
 
-    cmp_old = [normalize(t) for t in tok_old] if normalize else tok_old
-    cmp_new = [normalize(t) for t in tok_new] if normalize else tok_new
+    # Gate normalize behind has_dates: re.search short-circuits immediately for
+    # tokens with no date patterns, avoiding 200× re.sub calls per line.
+    if normalize:
+        cmp_old = [normalize(t) if has_dates(t) else t for t in tok_old]
+        cmp_new = [normalize(t) if has_dates(t) else t for t in tok_new]
+    else:
+        cmp_old = tok_old
+        cmp_new = tok_new
 
-    sm = difflib.SequenceMatcher(None, cmp_old, cmp_new, autojunk=False)
+    # autojunk=False is exact but O(n²) when repeated tokens (spaces, commas) dominate
+    # long sequences. For sequences > 200 tokens, enable autojunk so repeated delimiter
+    # tokens are treated as junk and matching stays O(content_tokens) rather than O(n²).
+    use_autojunk = len(cmp_old) > 200 or len(cmp_new) > 200
+    sm = difflib.SequenceMatcher(None, cmp_old, cmp_new, autojunk=use_autojunk)
     old_parts: List[str] = []
     new_parts: List[str] = []
 
@@ -192,7 +202,8 @@ def _diff_rows(lines_a: List[str], lines_b: List[str],
                context: int = 3,
                line_nums_a: Optional[List[int]] = None,
                line_nums_b: Optional[List[int]] = None,
-               normalize=None) -> list:
+               normalize=None,
+               word_diff: bool = True) -> list:
     """
     Compute diff opcodes and return a compact, JSON-serialisable row list.
 
@@ -229,7 +240,7 @@ def _diff_rows(lines_a: List[str], lines_b: List[str],
         elif tag == 'replace':
             del_lines = lines_a[i1:i2]
             ins_lines = lines_b[j1:j2]
-            if len(del_lines) == len(ins_lines):
+            if word_diff and len(del_lines) == len(ins_lines):
                 for k, (old, new) in enumerate(zip(del_lines, ins_lines)):
                     old_html, new_html = word_diff_inline(old, new, normalize=normalize)
                     rows.append([1, lna(i1+k), old_html])
@@ -242,25 +253,28 @@ def _diff_rows(lines_a: List[str], lines_b: List[str],
     return rows
 
 
-def _diff_tag(diff_id: str, rows: list) -> str:
-    """Serialise rows to gzip-compressed base64 JSON inside a <script> data tag."""
-    raw = _json.dumps(rows, separators=(',', ':'), ensure_ascii=False)
-    try:
-        b64 = base64.b64encode(
-            gzip.compress(raw.encode('utf-8'), compresslevel=9)
-        ).decode('ascii')
-        return (f'<script type="application/json" id="{diff_id}-data" data-enc="gz">'
-                f'{b64}</script>')
-    except Exception:
-        return (f'<script type="application/json" id="{diff_id}-data">'
-                f'{raw}</script>')
+def _b64gz(obj) -> str:
+    """Serialise obj to gzip-compressed base64 JSON string."""
+    raw = _json.dumps(obj, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+    return base64.b64encode(gzip.compress(raw, compresslevel=1)).decode('ascii')
 
 
-def _pages_tag(panel_id: str, data: dict) -> str:
-    """Serialise page comparison metadata as a plain JSON <script> data tag."""
-    raw = _json.dumps(data, separators=(',', ':'))
-    return (f'<script type="application/json" id="{panel_id}-pages-data">'
-            f'{raw}</script>')
+def _diff_rows_1v1(line_a: str, line_b: str, lna: int, lnb: int,
+                   normalize=None) -> list:
+    """Fast path for single-line-to-single-line diff used by CSV row comparison.
+
+    Bypasses diff_opcodes (pandas + LIS) entirely — for one line vs one line
+    the opcode is always equal or replace, so we detect it with a direct
+    string compare and call word_diff_inline only when the lines actually differ.
+
+    Eliminates 20,000× pandas DataFrame overhead when diffing large CSV files.
+    """
+    cmp_a = normalize(line_a) if normalize else line_a
+    cmp_b = normalize(line_b) if normalize else line_b
+    if cmp_a == cmp_b:
+        return [[0, lna, lnb, escape(line_a)]]
+    old_html, new_html = word_diff_inline(line_a, line_b, normalize=normalize)
+    return [[1, lna, old_html], [2, lnb, new_html]]
 
 
 def build_diff_html(lines_a: List[str], lines_b: List[str],
@@ -272,7 +286,7 @@ def build_diff_html(lines_a: List[str], lines_b: List[str],
     Build a unified-style HTML diff table (eager rendering).
 
     Uses _diff_rows() internally; kept for non-browser / test callers.
-    The HTML reporter uses _diff_rows() + _diff_tag() for deferred rendering.
+    The HTML reporter uses _diff_rows() with consolidated card blob rendering.
     """
     html_rows: List[str] = []
     for row in _diff_rows(lines_a, lines_b, context, line_nums_a, line_nums_b, normalize=normalize):
@@ -361,14 +375,14 @@ def pages_panel(page_comparisons: List[dict],
                 per_page_lines: List[Tuple[List[str], List[str]]],
                 panel_id: str,
                 per_page_line_numbers: Optional[List[Tuple[List[int], List[int]]]] = None,
-                normalize=None) -> Tuple[str, str]:
-    """Return (toggle_html, panel_html) for per-page comparison.
-    Returns ('', '') when there is nothing to show (single-page files).
-    Table content is deferred: stored as JSON in a <script> tag, built by
-    renderPages() in JS on first toggle — keeps zero <tr> nodes in the DOM at load.
+                normalize=None) -> Tuple[str, str, Optional[dict]]:
+    """Return (toggle_html, shell_html, data_dict) for per-page comparison.
+    Returns ('', '', None) when there is nothing to show (single-page files).
+    Data is returned as a plain dict to be included in the consolidated card blob;
+    renderPages() in JS receives it via el._pagesData set by the card-init path.
     """
     if not page_comparisons:
-        return '', ''
+        return '', '', None
 
     status_counts: dict = {}
     for pc in page_comparisons:
@@ -384,7 +398,6 @@ def pages_panel(page_comparisons: List[dict],
         status_counts[k] = status_counts.get(k, 0) + 1
 
     pages: list = []
-    script_tags: List[str] = []
     matched_idx = 0
 
     for pc in page_comparisons:
@@ -401,21 +414,21 @@ def pages_panel(page_comparisons: List[dict],
             else:
                 lnr = ''
 
-            diff_id = None
+            # Embed diff data inline in the pages JSON rather than separate <script> tags.
+            # JS decompresses on demand when the user expands a page's diff.
+            diff_b64 = None
             if r < 1.0 and matched_idx < len(per_page_lines):
-                diff_pid = f"{panel_id}-pd{matched_idx}"
                 la, lb = per_page_lines[matched_idx]
                 if per_page_line_numbers and matched_idx < len(per_page_line_numbers):
                     la_nums, lb_nums = per_page_line_numbers[matched_idx]
                 else:
                     la_nums, lb_nums = None, None
-                script_tags.append(
-                    _diff_tag(diff_pid, _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums, normalize=normalize))
-                )
-                diff_id = diff_pid
+                _rows = _diff_rows(la, lb, line_nums_a=la_nums, line_nums_b=lb_nums, normalize=normalize)
+                _raw = _json.dumps(_rows, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
+                diff_b64 = base64.b64encode(gzip.compress(_raw, compresslevel=1)).decode('ascii')
 
-            # [0, page_num_a, page_num_b, ratio, add, del, lnr, diff_id]
-            pages.append([0, pc["page_num_a"], pc["page_num_b"], r, add, ndel, lnr, diff_id])
+            # [0, page_num_a, page_num_b, ratio, add, del, lnr, diff_b64_or_null]
+            pages.append([0, pc["page_num_a"], pc["page_num_b"], r, add, ndel, lnr, diff_b64])
             matched_idx += 1
         elif pc["status"] == "added":
             # [1, page_num_b, lines]
@@ -426,17 +439,13 @@ def pages_panel(page_comparisons: List[dict],
 
     data = {"counts": status_counts, "pages": pages}
 
-    panel = (
-        f'<div class="sec-detail" id="{panel_id}" data-pages-src="{panel_id}-pages-data">'
-        + ''.join(script_tags)
-        + _pages_tag(panel_id, data)
-        + '</div>'
-    )
+    # Empty shell div — data lives in the consolidated card blob, wired by JS init.
+    shell = f'<div class="sec-detail" id="{panel_id}" data-pages-src="{panel_id}-pages-data"></div>'
     toggle = (
         f'<span class="card-toggle" onclick="toggle(this,\'{panel_id}\')">'
         f'▶ pages</span>'
     )
-    return toggle, panel
+    return toggle, shell, data
 
 
 
@@ -452,16 +461,21 @@ def pair_card(outcome: FilePairOutcome,
               file_txn_comparisons: Optional[List[dict]] = None,
               file_section_comparisons: Optional[List[dict]] = None,
               file_csv_comparisons: Optional[List[dict]] = None,
-              normalize=None) -> str:
-
+              normalize=None,
+              card_idx: int = 0) -> Tuple[str, Optional[dict]]:
+    """Return (shell_html, card_data_dict).
+    shell_html has empty panel divs; card_data_dict holds all panel data
+    for the consolidated blob. card_data_dict is None for error cards.
+    """
     if outcome.error:
-        return (
-            f'<div class="card error" id="{card_id}">'
+        html = (
+            f'<div class="card error" id="{card_id}" data-card-idx="{card_idx}">'
             f'<div class="card-header"><span class="badge significant">ERROR</span>'
             f' {outcome.file_a.name} ↔ {outcome.file_b.name}</div>'
             f'<p class="err-msg">{outcome.error}</p>'
             f'</div>'
         )
+        return html, None
 
     r     = outcome.result
     sm    = r.summary
@@ -513,28 +527,25 @@ def pair_card(outcome: FilePairOutcome,
                 eff_pcs.append({"status": "added", "page_num_a": None,
                                 "page_num_b": pnum_b, "lines": sec["lines"]})
 
-    pages_toggle, pages_detail = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln, normalize=normalize)
-
-    # Build the diff panel (only when there are differences)
-    # When CSV mode is active, diff the key-sorted lines so the diff reflects
-    # real value changes rather than row-order differences.
+    # CSV mode: skip pages panel — storing 20K raw CSV lines as one-page diff would
+    # add ~150 MB to the blob. The ▶ csv panel covers all row-level differences.
     if file_csv_comparisons is not None:
-        diff_lines_a: List[str] = []
-        diff_lines_b: List[str] = []
-        if outcome.csv_header_a:
-            diff_lines_a.append(",".join(outcome.csv_header_a))
-        if outcome.csv_header_b:
-            diff_lines_b.append(",".join(outcome.csv_header_b))
-        for rc in file_csv_comparisons:
-            if rc["status"] == "matched":
-                diff_lines_a.append(rc["row_a"].line)
-                diff_lines_b.append(rc["row_b"].line)
-            elif rc["status"] == "removed":
-                diff_lines_a.append(rc["row_a"].line)
-            else:
-                diff_lines_b.append(rc["row_b"].line)
-        diff_lna = diff_lnb = None  # line numbers not meaningful after sort
-        diff_label = "Inline diff — CSV rows sorted by key (headers &amp; footers excluded)"
+        eff_pcs = []
+        eff_ppl = []
+        eff_pln = None
+
+    pages_toggle, pages_detail, pages_data = pages_panel(eff_pcs, eff_ppl, pg_id, eff_pln, normalize=normalize)
+
+    # ── Diff rows (main diff panel) ──────────────────────────────────────────
+    diff_rows: Optional[list] = None
+    diff_panel  = ''
+    diff_toggle = ''
+
+    if file_csv_comparisons is not None:
+        # CSV mode: the ▶ csv panel shows per-row diffs — skip the raw unified diff.
+        # Building key-sorted diff_lines for 20K × 5 KB rows produces ~100 MB of blob
+        # data that the browser must decompress before any panel can open.
+        diff_toggle = '<span class="card-toggle no-diff">✓ no diff</span>' if ratio == 1.0 else ''
     else:
         diff_lines_a = body_lines_a
         diff_lines_b = body_lines_b
@@ -542,55 +553,49 @@ def pair_card(outcome: FilePairOutcome,
         diff_lnb = outcome.body_line_numbers_b or None
         diff_label = "Inline diff — body content (headers &amp; footers excluded)"
 
-    if ratio < 1.0 and (diff_lines_a or diff_lines_b):
-        _rows = _diff_rows(diff_lines_a, diff_lines_b,
-                           line_nums_a=diff_lna,
-                           line_nums_b=diff_lnb,
-                           normalize=normalize)
-        diff_panel = (
-            f'<div class="diff-outer" id="{diff_id}">'
-            f'<div class="diff-toolbar">'
-            f'  <span>{diff_label}</span>'
-            f'  <span class="diff-legend">'
-            f'    <span class="dl-del">− removed</span>'
-            f'    <span class="dl-chg">~ changed word</span>'
-            f'    <span class="dl-ins">+ added</span>'
-            f'  </span>'
-            f'</div>'
-            f'<div class="diff-wrap" data-diff-src="{diff_id}-data"></div>'
-            f'</div>'
-            + _diff_tag(diff_id, _rows)
-        )
-        diff_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{diff_id}\')">▶ diff</span>'
-    else:
-        diff_panel  = ''
-        diff_toggle = '<span class="card-toggle no-diff">✓ no diff</span>'
+        if ratio < 1.0 and (diff_lines_a or diff_lines_b):
+            diff_rows = _diff_rows(diff_lines_a, diff_lines_b,
+                                   line_nums_a=diff_lna, line_nums_b=diff_lnb,
+                                   normalize=normalize,
+                                   word_diff=True)
+            diff_panel = (
+                f'<div class="diff-outer" id="{diff_id}">'
+                f'<div class="diff-toolbar">'
+                f'  <span>{diff_label}</span>'
+                f'  <span class="diff-legend">'
+                f'    <span class="dl-del">− removed</span>'
+                f'    <span class="dl-chg">~ changed word</span>'
+                f'    <span class="dl-ins">+ added</span>'
+                f'  </span>'
+                f'</div>'
+                f'<div class="diff-wrap" data-diff-src="{diff_id}-data"></div>'
+                f'</div>'
+            )
+            diff_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{diff_id}\')">▶ diff</span>'
+        else:
+            diff_toggle = '<span class="card-toggle no-diff">✓ no diff</span>'
 
-    # Build the card-level transaction panel when file_txn_comparisons is provided
+    # ── Transaction panel ────────────────────────────────────────────────────
     txn_toggle = ''
     txn_panel  = ''
+    txn_data: Optional[dict] = None
     if file_txn_comparisons:
         txn_id = f"txn-{card_id}"
-        txn_script_tags: List[str] = []
         txn_entries: list = []
-        for ti, tc in enumerate(file_txn_comparisons):
+        for tc in file_txn_comparisons:
             key = tc["sort_key"]
             if tc["status"] == "matched":
                 tr2 = tc["diff"]["similarity_ratio"]
                 ta  = tc["diff"]["lines_added"]
                 td2 = tc["diff"]["lines_deleted"]
-                txn_diff_id = None
+                diff_b64 = None
                 if tr2 < 1.0:
-                    txn_did = f"{txn_id}-tx{ti}"
-                    tla = tc["txn_a"].lines
-                    tlb = tc["txn_b"].lines
-                    tna = tc["txn_a"].line_numbers or None
-                    tnb = tc["txn_b"].line_numbers or None
-                    txn_script_tags.append(
-                        _diff_tag(txn_did, _diff_rows(tla, tlb, line_nums_a=tna, line_nums_b=tnb, normalize=normalize))
-                    )
-                    txn_diff_id = txn_did
-                txn_entries.append([0, key, tr2, ta, td2, txn_diff_id])
+                    _r = _diff_rows(tc["txn_a"].lines, tc["txn_b"].lines,
+                                    line_nums_a=tc["txn_a"].line_numbers or None,
+                                    line_nums_b=tc["txn_b"].line_numbers or None,
+                                    normalize=normalize)
+                    diff_b64 = _b64gz(_r)
+                txn_entries.append([0, key, tr2, ta, td2, diff_b64])
             elif tc["status"] == "added":
                 txn_entries.append([1, key, len(tc["txn_b"].lines)])
             else:
@@ -599,38 +604,28 @@ def pair_card(outcome: FilePairOutcome,
         n_m = sum(1 for t in file_txn_comparisons if t["status"] == "matched")
         n_a = sum(1 for t in file_txn_comparisons if t["status"] == "added")
         n_r = sum(1 for t in file_txn_comparisons if t["status"] == "removed")
-        txn_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r},
-                    "txns": txn_entries}
-        txn_data_tag = (f'<script type="application/json" id="{txn_id}-data">'
-                        f'{_json.dumps(txn_data, separators=(",",":"))}</script>')
-        txn_panel = (
-            f'<div class="sec-detail" id="{txn_id}" data-txn-src="{txn_id}-data">'
-            + ''.join(txn_script_tags)
-            + txn_data_tag
-            + '</div>'
-        )
+        txn_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r}, "txns": txn_entries}
+        # Shell div only — data arrives via consolidated card blob
+        txn_panel  = f'<div class="sec-detail" id="{txn_id}" data-txn-src="{txn_id}-data"></div>'
         txn_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{txn_id}\')">▶ txn</span>'
 
-    # Build the card-level section panel when file_section_comparisons is provided
+    # ── Sections panel ───────────────────────────────────────────────────────
     sec_toggle = ''
     sec_panel  = ''
+    sec_data: Optional[dict] = None
     if file_section_comparisons:
         sec_id = f"sec-{card_id}"
-        sec_script_tags: List[str] = []
         sec_entries: list = []
-        for si, sc in enumerate(file_section_comparisons):
+        for sc in file_section_comparisons:
             if sc["status"] in ("identical", "changed"):
                 d   = sc["diff"]
                 sr  = d["similarity_ratio"]
                 sa  = d["lines_added"]
                 sd  = d["lines_deleted"]
-                sdid = f"{sec_id}-s{si}"
-                sec_script_tags.append(
-                    _diff_tag(sdid, _diff_rows(sc["lines_a"], sc["lines_b"], normalize=normalize))
-                )
+                diff_b64 = _b64gz(_diff_rows(sc["lines_a"], sc["lines_b"], normalize=normalize))
                 name_b = sc.get("name_b", sc["name"])
                 name_display = sc["name"] if name_b == sc["name"] else f'{sc["name"]} → {name_b}'
-                sec_entries.append([0, name_display, sr, sa, sd, sdid])
+                sec_entries.append([0, name_display, sr, sa, sd, diff_b64])
             elif sc["status"] == "added":
                 sec_entries.append([1, sc["name"], len(sc["lines_b"])])
             else:
@@ -642,63 +637,46 @@ def pair_card(outcome: FilePairOutcome,
         n_rm = sum(1 for s in file_section_comparisons if s["status"] == "removed")
         sec_data = {"summary": {"identical": n_id, "changed": n_ch, "added": n_ad, "removed": n_rm},
                     "sections": sec_entries}
-        sec_data_tag = (f'<script type="application/json" id="{sec_id}-data">'
-                        f'{_json.dumps(sec_data, separators=(",",":"))}</script>')
-        sec_panel = (
-            f'<div class="sec-detail" id="{sec_id}" data-sec-src="{sec_id}-data">'
-            + ''.join(sec_script_tags)
-            + sec_data_tag
-            + '</div>'
-        )
+        sec_panel  = f'<div class="sec-detail" id="{sec_id}" data-sec-src="{sec_id}-data"></div>'
         sec_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{sec_id}\')">▶ sections</span>'
 
-    # Build the CSV records panel
+    # ── CSV rows panel ───────────────────────────────────────────────────────
     csv_toggle = ''
     csv_panel  = ''
+    csv_data: Optional[dict] = None
     if file_csv_comparisons:
         csv_id = f"csv-{card_id}"
-        csv_script_tags: List[str] = []
-        csv_entries: list = []
-        for ci, rc in enumerate(file_csv_comparisons):
+        csv_entries = []
+        for rc in file_csv_comparisons:
             key = rc["key"]
             if rc["status"] == "matched":
                 cr = rc["diff"]["similarity_ratio"]
                 ca = rc["diff"]["lines_added"]
                 cd = rc["diff"]["lines_deleted"]
-                csv_did = None
+                # Store raw diff rows (not per-row gzip) — card-level compression handles it.
+                # Eliminates 10K-20K individual gzip.compress calls for large CSV files.
+                diff_rows_entry = None
                 if cr < 1.0:
-                    did = f"{csv_id}-r{ci}"
-                    rla = [rc["row_a"].line]
-                    rlb = [rc["row_b"].line]
-                    rna = [rc["row_a"].line_number]
-                    rnb = [rc["row_b"].line_number]
-                    csv_script_tags.append(
-                        _diff_tag(did, _diff_rows(rla, rlb, line_nums_a=rna, line_nums_b=rnb, normalize=normalize))
-                    )
-                    csv_did = did
-                csv_entries.append([0, key, cr, ca, cd, csv_did])
+                    diff_rows_entry = _diff_rows_1v1(
+                        rc["row_a"].line, rc["row_b"].line,
+                        rc["row_a"].line_number, rc["row_b"].line_number,
+                        normalize=normalize)
+                csv_entries.append([0, key, cr, ca, cd, diff_rows_entry])
             elif rc["status"] == "added":
                 csv_entries.append([1, key])
             else:
                 csv_entries.append([2, key])
 
-        n_m = sum(1 for r in file_csv_comparisons if r["status"] == "matched")
-        n_a = sum(1 for r in file_csv_comparisons if r["status"] == "added")
-        n_r = sum(1 for r in file_csv_comparisons if r["status"] == "removed")
-        csv_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r},
-                    "rows": csv_entries}
-        csv_data_tag = (f'<script type="application/json" id="{csv_id}-data">'
-                        f'{_json.dumps(csv_data, separators=(",",":"))}</script>')
-        csv_panel = (
-            f'<div class="sec-detail" id="{csv_id}" data-csv-src="{csv_id}-data">'
-            + ''.join(csv_script_tags)
-            + csv_data_tag
-            + '</div>'
-        )
+        n_m = sum(1 for r2 in file_csv_comparisons if r2["status"] == "matched")
+        n_a = sum(1 for r2 in file_csv_comparisons if r2["status"] == "added")
+        n_r = sum(1 for r2 in file_csv_comparisons if r2["status"] == "removed")
+        csv_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r}, "rows": csv_entries}
+        csv_panel  = f'<div class="sec-detail" id="{csv_id}" data-csv-src="{csv_id}-data"></div>'
         csv_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{csv_id}\')">▶ csv</span>'
 
+    # ── Card shell HTML (no embedded data scripts) ───────────────────────────
     html = f"""
-<div class="card {v_css}" id="{card_id}" data-verdict="{v_css}">
+<div class="card {v_css}" id="{card_id}" data-card-idx="{card_idx}" data-verdict="{v_css}">
 
   <div class="card-header">
     <span class="badge {v_css}">{v_lbl}</span>
@@ -746,7 +724,15 @@ def pair_card(outcome: FilePairOutcome,
   {diff_panel}
 
 </div>"""
-    return html
+
+    card_data = {
+        "diff_rows": diff_rows,
+        "pages":     pages_data,
+        "txn":       txn_data,
+        "sec":       sec_data,
+        "csv":       csv_data,
+    }
+    return html, card_data
 
 
 def unmatched_section(only_in_a: list, only_in_b: list,
@@ -1009,12 +995,20 @@ async function renderDiff(el){
   if(el.dataset.rendered)return;
   let rows=el._diffRows;
   if(!rows){
-    const script=document.getElementById(el.dataset.diffSrc);
-    if(!script)return;
+    let b64,isGz=true;
+    if(el._diffB64){
+      b64=el._diffB64;el._diffB64=null;
+    }else{
+      const script=document.getElementById(el.dataset.diffSrc);
+      if(!script)return;
+      isGz=script.dataset.enc==='gz';
+      b64=script.textContent.trim();
+      script.remove();
+    }
     try{
       let json;
-      if(script.dataset.enc==='gz'){
-        const bin=atob(script.textContent.trim());
+      if(isGz){
+        const bin=atob(b64);
         const bytes=new Uint8Array(bin.length);
         for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
         const ds=new DecompressionStream('gzip');
@@ -1022,11 +1016,10 @@ async function renderDiff(el){
         w.write(bytes);w.close();
         json=new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
       }else{
-        json=script.textContent;
+        json=b64;
       }
       rows=JSON.parse(json);
       el._diffRows=rows;
-      script.remove();
     }catch(e){
       el.insertAdjacentHTML('beforeend','<p style="color:red;padding:8px;font-family:sans-serif">Diff render error: '+e.message+'</p>');
       el.dataset.rendered='1';
@@ -1059,43 +1052,88 @@ async function renderDiff(el){
   el.dataset.rendered='1';
 }
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function _makePanelScaffold(el,hdrHtml,thHtml){
+  const wrap=document.createElement('div');
+  wrap.className='panel-content';
+  wrap.innerHTML=hdrHtml;
+  const tbl=document.createElement('table');
+  tbl.className='sec-table txn-table';
+  tbl.innerHTML=`<thead><tr>${thHtml}</tr></thead>`;
+  const tbody=document.createElement('tbody');
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
+  el.appendChild(wrap);
+  el.dataset.rendered='1';
+  return tbody;
+}
+function _chunkRows(items,tbody,buildRow){
+  let i=0;const CHUNK=100;
+  function addChunk(){
+    const frag=document.createDocumentFragment();
+    const end=Math.min(i+CHUNK,items.length);
+    for(;i<end;i++)frag.appendChild(buildRow(items[i],i));
+    tbody.appendChild(frag);
+    if(i<items.length)requestAnimationFrame(addChunk);
+  }
+  addChunk();
+}
+async function toggleEntryDiff(btn,panelId,entryIdx){
+  const panel=document.getElementById(panelId);
+  const row=btn.closest('tr');
+  const next=row.nextElementSibling;
+  if(next&&next.classList.contains('diff-row')){
+    const dw=next.querySelector('.diff-wrap');
+    if(dw&&dw._diffAbort){dw._diffAbort.abort();delete dw._diffAbort;}
+    next.remove();
+    const entry=panel._panelData[entryIdx];
+    btn.textContent=entry[2]===1?'▶ view':'▶ diff';
+    return;
+  }
+  const entry=panel._panelData[entryIdx];
+  const diffData=entry[5];
+  if(!diffData)return;
+  const diffRow=document.createElement('tr');
+  diffRow.className='diff-row open';
+  const td=document.createElement('td');td.colSpan=5;
+  const outer=document.createElement('div');outer.className='diff-outer open';
+  outer.innerHTML=`<div class="diff-toolbar"><span>${escHtml(String(entry[1]))}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div>`;
+  const dw=document.createElement('div');dw.className='diff-wrap';
+  // Array = raw diff rows (CSV entries); string = gzip+b64 (txn/sec entries)
+  if(Array.isArray(diffData)){dw._diffRows=diffData;}else{dw._diffB64=diffData;}
+  outer.appendChild(dw);td.appendChild(outer);diffRow.appendChild(td);
+  row.after(diffRow);
+  btn.textContent='▼'+btn.textContent.slice(1);
+  await renderDiff(dw);
+}
 function renderTxnPanel(el,txnSrcId){
   if(el.dataset.rendered)return;
   let d=el._txnData;
   if(!d){
     const script=document.getElementById(txnSrcId);
     if(!script)return;
-    d=JSON.parse(script.textContent);
-    el._txnData=d;
-    script.remove();
+    d=JSON.parse(script.textContent);el._txnData=d;script.remove();
   }
+  el._panelData=d.txns;
   const s=d.summary;
+  const pid=el.id;
   let hdr=`<div class="txn-summary">Transactions: <strong>${s.matched}</strong> matched`;
   if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
   if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
   hdr+='</div>';
-  let tb='';
-  for(const t of d.txns){
+  const tbody=_makePanelScaffold(el,hdr,'<th>Sort Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th>');
+  _chunkRows(d.txns,tbody,(t,i)=>{
+    const tr=document.createElement('tr');
     if(t[0]===0){
-      const[,key,ratio,add,ndel,did]=t;
+      const[,key,ratio,add,ndel,diffB64]=t;
       const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
       const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
-      const sim=(ratio*100).toFixed(1)+'%';
-      const chg=`+${add} −${ndel}`;
-      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
-      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
-      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Txn: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
-    }else if(t[0]===1){
-      tb+=`<tr class="s-added"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
-    }else{
-      tb+=`<tr class="s-removed"><td class="mono">${escHtml(t[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td></tr>`;
-    }
-  }
-  const wrap=document.createElement('div');
-  wrap.className='panel-content';
-  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Sort Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
-  el.appendChild(wrap);
-  el.dataset.rendered='1';
+      const dcell=diffB64?`<span class="card-toggle" onclick="toggleEntryDiff(this,'${pid}',${i})">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+      tr.className=css;
+      tr.innerHTML=`<td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${(ratio*100).toFixed(1)}%</td><td class="num mono">+${add} −${ndel}</td><td>${dcell}</td>`;
+    }else if(t[0]===1){tr.className='s-added';tr.innerHTML=`<td class="mono">${escHtml(t[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td>`;}
+    else{tr.className='s-removed';tr.innerHTML=`<td class="mono">${escHtml(t[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${t[2]} lines</td><td></td>`;}
+    return tr;
+  });
 }
 function renderSectionsPanel(el,srcId){
   if(el.dataset.rendered)return;
@@ -1103,40 +1141,75 @@ function renderSectionsPanel(el,srcId){
   if(!d){
     const script=document.getElementById(srcId);
     if(!script)return;
-    d=JSON.parse(script.textContent);
-    el._secData=d;
-    script.remove();
+    d=JSON.parse(script.textContent);el._secData=d;script.remove();
   }
+  el._panelData=d.sections;
   const s=d.summary;
-  let hdr=`<div class="txn-summary">Sections:`;
+  const pid=el.id;
+  let hdr='<div class="txn-summary">Sections:';
   if(s.identical)hdr+=` <strong>${s.identical}</strong> identical`;
   if(s.changed)hdr+=` · <strong style="color:var(--s-moderate)">${s.changed}</strong> changed`;
   if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
   if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
   hdr+='</div>';
-  let tb='';
-  for(const sc of d.sections){
+  const tbody=_makePanelScaffold(el,hdr,'<th>Section</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th>');
+  _chunkRows(d.sections,tbody,(sc,i)=>{
+    const tr=document.createElement('tr');
     if(sc[0]===0){
-      const[,name,ratio,add,ndel,did]=sc;
+      const[,name,ratio,add,ndel,diffB64]=sc;
       const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
       const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
-      const sim=(ratio*100).toFixed(1)+'%';
-      const chg=`+${add} −${ndel}`;
       const lbl=ratio===1?'▶ view':'▶ diff';
-      const dcell=`<span class="card-toggle" onclick="toggle(this,'${did}')">${lbl}</span>`;
-      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(name)}">${escHtml(name)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
-      tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>${escHtml(name)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
-    }else if(sc[0]===1){
-      tb+=`<tr class="s-added"><td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td></tr>`;
-    }else{
-      tb+=`<tr class="s-removed"><td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td></tr>`;
-    }
+      tr.className=css;
+      tr.innerHTML=`<td class="mono" title="${escHtml(name)}">${escHtml(name)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${(ratio*100).toFixed(1)}%</td><td class="num mono">+${add} −${ndel}</td><td><span class="card-toggle" onclick="toggleEntryDiff(this,'${pid}',${i})">${lbl}</span></td>`;
+    }else if(sc[0]===1){tr.className='s-added';tr.innerHTML=`<td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td>`;}
+    else{tr.className='s-removed';tr.innerHTML=`<td class="mono">${escHtml(sc[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${sc[2]} lines</td><td></td>`;}
+    return tr;
+  });
+}
+function _csvBuildRow(r,origIdx,pid){
+  const tr=document.createElement('tr');
+  if(r[0]===0){
+    const[,key,ratio,add,ndel,diffData]=r;
+    const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+    const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+    const dcell=diffData?`<span class="card-toggle" onclick="toggleEntryDiff(this,'${pid}',${origIdx})">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+    tr.className=css;
+    tr.innerHTML=`<td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${(ratio*100).toFixed(1)}%</td><td class="num mono">+${add} −${ndel}</td><td>${dcell}</td>`;
+  }else if(r[0]===1){
+    tr.className='s-added';
+    tr.innerHTML=`<td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">—</td><td></td>`;
+  }else{
+    tr.className='s-removed';
+    tr.innerHTML=`<td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">—</td><td></td>`;
   }
-  const wrap=document.createElement('div');
-  wrap.className='panel-content';
-  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Section</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
-  el.appendChild(wrap);
-  el.dataset.rendered='1';
+  return tr;
+}
+function _csvChunk(el,rows,pid){
+  // Generation counter: incrementing cancels any in-flight chunked render.
+  el._csvGen=(el._csvGen||0)+1;
+  const myGen=el._csvGen;
+  const tbody=el._csvTbody;
+  tbody.innerHTML='';
+  const idxMap=el._csvIdxMap;
+  let i=0;const CHUNK=100;
+  function go(){
+    if(el._csvGen!==myGen)return;
+    const frag=document.createDocumentFragment();
+    const end=Math.min(i+CHUNK,rows.length);
+    for(;i<end;i++){const r=rows[i];frag.appendChild(_csvBuildRow(r,idxMap.get(r)??i,pid));}
+    tbody.appendChild(frag);
+    if(i<rows.length)requestAnimationFrame(go);
+  }
+  requestAnimationFrame(go);
+}
+function csvSetFilter(pid,showAll){
+  const el=document.getElementById(pid);if(!el)return;
+  const f0=document.getElementById(pid+'-f0');
+  const f1=document.getElementById(pid+'-f1');
+  if(f0)f0.classList.toggle('active',!showAll);
+  if(f1)f1.classList.toggle('active',showAll);
+  _csvChunk(el,showAll?el._csvAllRows:el._csvDiffRows,pid);
 }
 function renderCsvPanel(el,srcId){
   if(el.dataset.rendered)return;
@@ -1144,37 +1217,34 @@ function renderCsvPanel(el,srcId){
   if(!d){
     const script=document.getElementById(srcId);
     if(!script)return;
-    d=JSON.parse(script.textContent);
-    el._csvData=d;
-    script.remove();
+    d=JSON.parse(script.textContent);el._csvData=d;script.remove();
   }
+  const allRows=d.rows;
+  const diffRows=allRows.filter(r=>r[0]!==0||r[2]<1.0);
+  const hasFilter=diffRows.length<allRows.length;
+  el._panelData=allRows;
+  el._csvAllRows=allRows;
+  el._csvDiffRows=diffRows;
+  el._csvIdxMap=new Map(allRows.map((r,i)=>[r,i]));
+  const pid=el.id;
   const s=d.summary;
   let hdr=`<div class="txn-summary">CSV rows: <strong>${s.matched}</strong> matched`;
   if(s.added)hdr+=` · <strong style="color:var(--s-added)">${s.added}</strong> added`;
   if(s.removed)hdr+=` · <strong style="color:var(--s-removed)">${s.removed}</strong> removed`;
   hdr+='</div>';
-  let tb='';
-  for(const r of d.rows){
-    if(r[0]===0){
-      const[,key,ratio,add,ndel,did]=r;
-      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
-      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
-      const sim=(ratio*100).toFixed(1)+'%';
-      const chg=`+${add} −${ndel}`;
-      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
-      tb+=`<tr class="${css}"><td class="mono" title="${escHtml(key)}">${escHtml(key)}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td>${dcell}</td></tr>`;
-      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Row: ${escHtml(key)}</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
-    }else if(r[0]===1){
-      tb+=`<tr class="s-added"><td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">—</td><td></td></tr>`;
-    }else{
-      tb+=`<tr class="s-removed"><td class="mono" title="${escHtml(r[1])}">${escHtml(r[1])}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">—</td><td></td></tr>`;
-    }
+  const wrap=document.createElement('div');wrap.className='panel-content';
+  wrap.innerHTML=hdr;
+  if(hasFilter){
+    const fb=document.createElement('div');fb.className='pg-filter-bar';
+    fb.innerHTML=`<button class="pf-btn pf-all active" id="${pid}-f0" onclick="csvSetFilter('${pid}',false)">Changed &amp; different (${diffRows.length})</button><button class="pf-btn pf-all" id="${pid}-f1" onclick="csvSetFilter('${pid}',true)">All rows (${allRows.length})</button>`;
+    wrap.appendChild(fb);
   }
-  const wrap=document.createElement('div');
-  wrap.className='panel-content';
-  wrap.innerHTML=hdr+`<table class="sec-table txn-table"><thead><tr><th>Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
-  el.appendChild(wrap);
-  el.dataset.rendered='1';
+  const tbl=document.createElement('table');tbl.className='sec-table txn-table';
+  tbl.innerHTML='<thead><tr><th>Key</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead>';
+  const tbody=document.createElement('tbody');tbl.appendChild(tbody);wrap.appendChild(tbl);
+  el.appendChild(wrap);el.dataset.rendered='1';
+  el._csvTbody=tbody;
+  _csvChunk(el,hasFilter?diffRows:allRows,pid);
 }
 function renderPages(el){
   if(el.dataset.rendered)return;
@@ -1191,47 +1261,152 @@ function renderPages(el){
   const total=Object.values(d.counts).reduce((a,b)=>a+b,0);
   let fb=`<button class="pf-btn pf-all active" onclick="setPageFilter('${pid}','all')">All (${total})</button>`;
   for(const[css,lbl]of SM){const cnt=d.counts[css]||0;if(cnt)fb+=`<button class="pf-btn pf-${css}" onclick="setPageFilter('${pid}','${css}')"><span class="pf-dot ${css}"></span>${lbl} (${cnt})</button>`;}
-  let tb='';
-  for(const pg of d.pages){
-    if(pg[0]===0){
-      const[,pna,pnb,ratio,add,ndel,lnr,did]=pg;
-      const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
-      const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
-      const sim=(ratio*100).toFixed(1)+'%';
-      const chg=`+${add} −${ndel}`;
-      const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
-      const dcell=did?`<span class="card-toggle" onclick="toggle(this,'${did}')">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
-      tb+=`<tr class="${css}"><td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td></tr>`;
-      if(did)tb+=`<tr class="diff-row" id="${did}"><td colspan="5"><div class="diff-outer open"><div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div><div class="diff-wrap" data-diff-src="${did}-data"></div></div></td></tr>`;
-    }else if(pg[0]===1){
-      const[,pnb,lines]=pg;
-      tb+=`<tr class="s-added"><td>Page ${pnb}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
-    }else{
-      const[,pna,lines]=pg;
-      tb+=`<tr class="s-removed"><td>Page ${pna}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${lines} lines</td><td></td></tr>`;
-    }
-  }
   const wrap=document.createElement('div');
   wrap.className='panel-content';
-  wrap.innerHTML=`<div class="pg-filter-bar">${fb}</div><table class="sec-table"><thead><tr><th>Page</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead><tbody>${tb}</tbody></table>`;
+  const fbar=document.createElement('div');
+  fbar.className='pg-filter-bar';
+  fbar.innerHTML=fb;
+  wrap.appendChild(fbar);
+  const tbl=document.createElement('table');
+  tbl.className='sec-table';
+  tbl.innerHTML='<thead><tr><th>Page</th><th>Status</th><th class="num">Similarity</th><th class="num">Changes</th><th></th></tr></thead>';
+  const tbody=document.createElement('tbody');
+  tbl.appendChild(tbody);
+  wrap.appendChild(tbl);
   el.appendChild(wrap);
   el.dataset.rendered='1';
+  // Chunked rendering — 100 rows per animation frame so the panel opens immediately
+  let i=0;
+  const CHUNK=100;
+  function addChunk(){
+    const curFilter=el._pgFilter||'all';
+    const frag=document.createDocumentFragment();
+    const end=Math.min(i+CHUNK,d.pages.length);
+    for(;i<end;i++){
+      const pg=d.pages[i];
+      const tr=document.createElement('tr');
+      if(pg[0]===0){
+        const[,pna,pnb,ratio,add,ndel,lnr,diffB64]=pg;
+        const css=ratio===1?'s-identical':ratio>=0.85?'s-minor':ratio>=0.60?'s-moderate':'s-significant';
+        const badge=ratio===1?'IDENTICAL':ratio>=0.85?'MINOR':ratio>=0.60?'MODERATE':'CHANGED';
+        const sim=(ratio*100).toFixed(1)+'%';
+        const chg=`+${add} −${ndel}`;
+        const lnrSpan=lnr?`<br><span class="pg-lnr">${lnr}</span>`:'';
+        const dcell=diffB64?`<span class="card-toggle" onclick="togglePageDiff(this,'${pid}',${i})">▶ diff</span>`:'<span class="card-toggle no-diff">✓</span>';
+        tr.className=css;
+        tr.innerHTML=`<td>Page ${pna}${lnrSpan}</td><td><span class="badge ${css}">${badge}</span></td><td class="num">${sim}</td><td class="num mono">${chg}</td><td class="num">${dcell}</td>`;
+      }else if(pg[0]===1){
+        tr.className='s-added';
+        tr.innerHTML=`<td>Page ${pg[1]}</td><td><span class="badge s-added">ADDED</span></td><td class="num">—</td><td class="num mono">${pg[2]} lines</td><td></td>`;
+      }else{
+        tr.className='s-removed';
+        tr.innerHTML=`<td>Page ${pg[1]}</td><td><span class="badge s-removed">REMOVED</span></td><td class="num">—</td><td class="num mono">${pg[2]} lines</td><td></td>`;
+      }
+      if(curFilter!=='all'&&!tr.classList.contains(curFilter))tr.style.display='none';
+      frag.appendChild(tr);
+    }
+    tbody.appendChild(frag);
+    if(i<d.pages.length)requestAnimationFrame(addChunk);
+  }
+  addChunk();
+}
+async function togglePageDiff(btn,panelId,pageIdx){
+  const panel=document.getElementById(panelId);
+  const row=btn.closest('tr');
+  const next=row.nextElementSibling;
+  if(next&&next.classList.contains('diff-row')){
+    const dw=next.querySelector('.diff-wrap');
+    if(dw&&dw._diffAbort){dw._diffAbort.abort();delete dw._diffAbort;}
+    next.remove();
+    btn.textContent='▶ diff';
+    return;
+  }
+  const pg=panel._pagesData.pages[pageIdx];
+  const pna=pg[1];
+  const diffB64=pg[7];
+  if(!diffB64)return;
+  const diffRow=document.createElement('tr');
+  diffRow.className='diff-row open';
+  const td=document.createElement('td');
+  td.colSpan=5;
+  const outer=document.createElement('div');
+  outer.className='diff-outer open';
+  outer.innerHTML=`<div class="diff-toolbar"><span>Page ${pna} — inline diff</span><span class="diff-legend"><span class="dl-del">− removed</span><span class="dl-chg">~ changed word</span><span class="dl-ins">+ added</span></span></div>`;
+  const dw=document.createElement('div');
+  dw.className='diff-wrap';
+  dw._diffB64=diffB64;
+  outer.appendChild(dw);
+  td.appendChild(outer);
+  diffRow.appendChild(td);
+  row.after(diffRow);
+  btn.textContent='▼ diff';
+  await renderDiff(dw);
 }
 function clearPanel(el){
-  // Abort scroll listeners on any diff panels (self + nested)
+  // Abort scroll listeners on regular diff panels (data-diff-src)
   [el,...Array.from(el.querySelectorAll('[data-diff-src]'))].forEach(dw=>{
     if(dw._diffAbort){dw._diffAbort.abort();delete dw._diffAbort;}
     if(dw.dataset.diffSrc){dw.style.maxHeight='';delete dw.dataset.rendered;}
   });
+  // Abort scroll listeners on on-demand page diff panels (no data-diff-src)
+  el.querySelectorAll('.diff-row .diff-wrap').forEach(dw=>{
+    if(dw._diffAbort){dw._diffAbort.abort();delete dw._diffAbort;}
+  });
   el.querySelectorAll('.panel-content').forEach(c=>c.remove());
   delete el.dataset.rendered;
 }
+// ── Card lazy-init via consolidated blob ─────────────────────────────────────
+let _cardBlobs=null;
+function _getCardBlobs(){
+  if(!_cardBlobs){
+    const s=document.getElementById('all-card-data');
+    _cardBlobs=s?JSON.parse(s.textContent):[];
+  }
+  return _cardBlobs;
+}
+async function _decompressB64(b64){
+  const bin=atob(b64);
+  const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);
+  const ds=new DecompressionStream('gzip');
+  const w=ds.writable.getWriter();
+  w.write(bytes);w.close();
+  return new TextDecoder().decode(await new Response(ds.readable).arrayBuffer());
+}
+function _initCard(card){
+  if(card._initPromise)return card._initPromise;
+  const idx=+card.dataset.cardIdx;
+  const blobs=_getCardBlobs();
+  card._initPromise=(async()=>{
+    if(idx>=blobs.length)return;
+    const data=JSON.parse(await _decompressB64(blobs[idx]));
+    // Wire diff rows directly — renderDiff checks _diffRows before _diffB64
+    if(data.diff_rows){
+      const dEl=card.querySelector('[data-diff-src]');
+      if(dEl)dEl._diffRows=data.diff_rows;
+    }
+    if(data.pages){const pEl=card.querySelector('[data-pages-src]');if(pEl)pEl._pagesData=data.pages;}
+    if(data.txn){const tEl=card.querySelector('[data-txn-src]');if(tEl)tEl._txnData=data.txn;}
+    if(data.sec){const sEl=card.querySelector('[data-sec-src]');if(sEl)sEl._secData=data.sec;}
+    if(data.csv){const cEl=card.querySelector('[data-csv-src]');if(cEl)cEl._csvData=data.csv;}
+    card.dataset.initialized='1';
+  })();
+  return card._initPromise;
+}
+// Preload cards as they approach the viewport (1200px margin keeps init ahead of user)
+const _cardIO=new IntersectionObserver(entries=>{
+  entries.forEach(e=>{if(e.isIntersecting&&!e.target._initPromise)_initCard(e.target);});
+},{rootMargin:'1200px'});
+
 async function toggle(btn,id){
   const el=document.getElementById(id);
   const wasOpen=el.classList.contains('open');
   if(wasOpen){
     clearPanel(el);
   }else{
+    // Await card init so panel data is ready before first render
+    const card=el.closest('[data-card-idx]');
+    if(card&&!card.dataset.initialized)await _initCard(card);
     if(el.dataset.pagesSrc&&!el.dataset.rendered)renderPages(el);
     else if(el.dataset.txnSrc&&!el.dataset.rendered)renderTxnPanel(el,el.dataset.txnSrc);
     else if(el.dataset.secSrc&&!el.dataset.rendered)renderSectionsPanel(el,el.dataset.secSrc);
@@ -1261,6 +1436,7 @@ function setFilter(verdict){
 }
 function setPageFilter(panelId,css){
   const panel=document.getElementById(panelId);
+  panel._pgFilter=css;
   panel.querySelectorAll('.pf-btn').forEach(b=>b.classList.remove('active'));
   panel.querySelector('.pf-'+(css==='all'?'all':css)).classList.add('active');
   panel.querySelectorAll('table.sec-table > tbody > tr:not(.diff-row)').forEach(row=>{
@@ -1272,6 +1448,7 @@ function setPageFilter(panelId,css){
 }
 document.addEventListener('DOMContentLoaded',()=>{
   document.querySelector('.f-all').classList.add('active');
+  document.querySelectorAll('[data-card-idx]').forEach(c=>_cardIO.observe(c));
 });
 """
 
@@ -1281,7 +1458,8 @@ def build_html(folder_a: Path, folder_b: Path,
                outcomes: List[FilePairOutcome],
                cards_html: str,
                unmatched_html: str,
-               ext: str) -> str:
+               ext: str,
+               all_card_blobs: Optional[List[str]] = None) -> str:
 
     total = len(outcomes)
     ok    = [o for o in outcomes if not o.error]
@@ -1376,6 +1554,7 @@ def build_html(folder_a: Path, folder_b: Path,
 
 </div>
 <script>{JS}</script>
+<script type="application/json" id="all-card-data">{_json.dumps(all_card_blobs or [])}</script>
 </body>
 </html>"""
 
@@ -1430,7 +1609,8 @@ def run(folder_a: Path, folder_b: Path,
           file=sys.stderr)
 
     outcomes: List[FilePairOutcome] = []
-    cards_html = ""
+    card_shells: List[str] = []
+    all_card_blobs: List[str] = []
 
     all_pairs = (
         [(pa, pb, "exact", 1.0) for pa, pb in match.exact_pairs] +
@@ -1468,18 +1648,23 @@ def run(folder_a: Path, folder_b: Path,
 
         card_id = f"card-{i}"
         normalize = remove_dates_from_line if ignore_dates else None
-        cards_html += pair_card(outcome, url_a, url_b, card_id,
-                                 body_a, body_b, per_page_lines,
-                                 file_txn_comparisons=outcome.file_txn_comparisons or None,
-                                 file_section_comparisons=outcome.file_section_comparisons or None,
-                                 file_csv_comparisons=outcome.file_csv_comparisons or None,
-                                 normalize=normalize)
+        shell, card_data = pair_card(outcome, url_a, url_b, card_id,
+                                     body_a, body_b, per_page_lines,
+                                     file_txn_comparisons=outcome.file_txn_comparisons or None,
+                                     file_section_comparisons=outcome.file_section_comparisons or None,
+                                     file_csv_comparisons=outcome.file_csv_comparisons or None,
+                                     normalize=normalize,
+                                     card_idx=i)
+        card_shells.append(shell)
+        # Encode card data as a single gzip+base64 blob; None for error cards → empty dict
+        all_card_blobs.append(_b64gz(card_data if card_data is not None else {}))
 
     unmatched_html = unmatched_section(match.only_in_a, match.only_in_b,
                                         linux_base, windows_base)
 
     html = build_html(folder_a, folder_b, match, outcomes,
-                       cards_html, unmatched_html, ext)
+                       "".join(card_shells), unmatched_html, ext,
+                       all_card_blobs=all_card_blobs)
 
     output.write_text(html, encoding="utf-8")
     print(f"\nHTML report → {output}", file=sys.stderr)
