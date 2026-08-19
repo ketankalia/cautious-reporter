@@ -316,5 +316,12 @@ python html_reporter.py folder_a/ folder_b/ --output results/report.html \
 Output files in `results/`:
 - `report.html` — self-contained interactive report (all CSS/JS embedded, works offline)
 - `<file>_txn.csv` per pair (when transactions enabled)
+file format for xlsx
+Seq	Column Name	Field Start	Field Length
+1	ACCT_NO	1	8
+2	CUST_NAME	10	20
+3	AMOUNT	31	10
+4	TXN_DATE	42	8
+5	STATUS	51	6
 - `<file>_sections.csv` per pair (when separator_pattern set)
 - `<file>_csv.csv` per pair (when csv_key_col set)
