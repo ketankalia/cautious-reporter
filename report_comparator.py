@@ -101,6 +101,19 @@ class CsvRow:
 
 
 @dataclass
+class FieldDef:
+    """One entry from a format-mapper XLSX: describes a named fixed-width field."""
+    seq: int
+    name: str
+    start: int    # 1-based character position
+    length: int   # number of characters
+
+    def extract(self, line: str) -> str:
+        s = self.start - 1  # convert to 0-based index
+        return line[s:s + self.length].strip()
+
+
+@dataclass
 class ParsedReport:
     filename: str
     pages: List[Page] = field(default_factory=list)
@@ -131,15 +144,94 @@ class SplitRule:
     separator_re: Optional[re.Pattern] = None
     csv_key_cols: Optional[List[Tuple[int, Optional[int]]]] = None  # (start, length) slices; length=None → read to next comma
     csv_has_header: bool = False
+    field_defs: Optional[List[FieldDef]] = None   # loaded from format_mapper XLSX when present
+
+
+def _load_field_defs(xlsx_path: str, csv_path: str, row_num: int) -> Optional[List[FieldDef]]:
+    """Load fixed-width field layout from a format-mapper XLSX file.
+
+    Expected XLSX columns (auto-detected by keyword match, case-insensitive):
+      seq / sequence / #     — field sequence number
+      name / column / field  — field name
+      start / pos / position — 1-based character start position
+      len / length / size    — field length in characters
+    """
+    try:
+        import pandas as _pd
+        df = _pd.read_excel(xlsx_path)
+    except ImportError:
+        print(
+            "ERROR: openpyxl is required to read format_mapper XLSX files.\n"
+            "       Install with: pip install openpyxl",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    except Exception as exc:
+        print(
+            f"ERROR: {csv_path} row {row_num}: cannot read format_mapper {xlsx_path!r}: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Auto-detect column roles by substring keyword matching
+    norm = {c.lower().replace(" ", "_").replace("-", "_"): c for c in df.columns}
+
+    def _find(*keywords: str) -> Optional[str]:
+        for kw in keywords:
+            for nk, orig in norm.items():
+                if kw in nk:
+                    return orig
+        return None
+
+    seq_col   = _find("seq", "sequence", "#", "no")
+    name_col  = _find("name", "column", "field", "col")
+    start_col = _find("start", "pos", "position", "begin", "from")
+    len_col   = _find("len", "length", "size", "width")
+
+    missing = [label for label, col in [("seq", seq_col), ("name/column", name_col),
+                                         ("start/pos", start_col), ("len/length", len_col)]
+               if col is None]
+    if missing:
+        print(
+            f"ERROR: {csv_path} row {row_num}: format_mapper {xlsx_path!r}: "
+            f"cannot identify columns for: {', '.join(missing)}. "
+            f"Expected keyword matches for: seq, name/column, start/pos, len/length.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    defs: List[FieldDef] = []
+    for _, r in df.iterrows():
+        try:
+            start  = int(r[start_col])
+            length = int(r[len_col])
+        except (ValueError, TypeError):
+            continue   # skip rows with non-numeric start/length (e.g. blank trailing rows)
+        if length <= 0:
+            continue
+        seq  = int(r[seq_col]) if _pd.notna(r[seq_col]) else len(defs) + 1
+        name = str(r[name_col]).strip()
+        defs.append(FieldDef(seq=seq, name=name, start=start, length=length))
+
+    if not defs:
+        print(
+            f"WARNING: {csv_path} row {row_num}: format_mapper {xlsx_path!r}: "
+            "no valid field definitions found (check start/length columns).",
+            file=sys.stderr,
+        )
+        return None
+    return defs
 
 
 def load_split_config(csv_path: str) -> List["SplitRule"]:
     """Load split-config CSV into SplitRule list.
 
     Columns: report_pattern, split_pattern, sort_pattern, max_txn_lines,
-             separator_pattern, csv_key_col, csv_has_header
+             separator_pattern, csv_key_col, csv_has_header, format_mapper
     All columns after report_pattern are optional.
     csv_key_col accepts position:length slices (e.g. "5:8" or "5:8,20:6" for composite).
+    format_mapper is a path to an XLSX file defining fixed-width field layout; path is
+    resolved relative to the splits CSV directory when not absolute.
     """
     def _compile(pattern: str, column: str, row_num: int) -> re.Pattern:
         try:
@@ -225,6 +317,14 @@ def load_split_config(csv_path: str) -> List["SplitRule"]:
                         csv_key_cols.append((pos_v - 1, None))
             else:
                 csv_key_cols = None
+            fmt_mapper_raw = (row.get("format_mapper") or "").strip()
+            field_defs: Optional[List[FieldDef]] = None
+            if fmt_mapper_raw:
+                mapper_path = (
+                    fmt_mapper_raw if Path(fmt_mapper_raw).is_absolute()
+                    else str(Path(csv_path).parent / fmt_mapper_raw)
+                )
+                field_defs = _load_field_defs(mapper_path, csv_path, row_num)
             rules.append(SplitRule(
                 report_re=_compile(row["report_pattern"], "report_pattern", row_num),
                 split_re=_compile(split_pat, "split_pattern", row_num) if split_pat else None,
@@ -233,6 +333,7 @@ def load_split_config(csv_path: str) -> List["SplitRule"]:
                 separator_re=_compile(sep_pat, "separator_pattern", row_num) if sep_pat else None,
                 csv_key_cols=csv_key_cols,
                 csv_has_header=has_hdr_raw == "true",
+                field_defs=field_defs,
             ))
     return rules
 
@@ -294,6 +395,18 @@ def find_csv_key_cols(filename: str,
     for rule in rules:
         if rule.report_re.search(name):
             return rule.csv_key_cols
+    return None
+
+
+def find_field_defs(filename: str,
+                    rules: Optional[List["SplitRule"]]) -> Optional[List[FieldDef]]:
+    """Return field_defs for the first matching rule, else None."""
+    if not rules:
+        return None
+    name = Path(filename).name
+    for rule in rules:
+        if rule.report_re.search(name):
+            return rule.field_defs
     return None
 
 
@@ -1491,6 +1604,181 @@ def write_csv_row_csv(file_csv_comparisons: List[Dict], csv_path: Path) -> None:
                 w.writerow([key, status, "", 0, 1])
 
 
+def write_csv_xlsx(
+    file_csv_comparisons: List[Dict],
+    xlsx_path: Path,
+    field_defs: Optional[List["FieldDef"]] = None,
+    normalize=None,
+) -> None:
+    """Write CSV row comparison results to a colour-coded XLSX file.
+
+    Row colour coding:
+      IDENTICAL  → white (no fill)
+      CHANGED    → light yellow row; amber cell fill on each changed field
+                   (amber fill only when field_defs is provided)
+      ADDED      → light green
+      REMOVED    → light pink
+
+    When field_defs is provided the sheet has paired A / B columns per field.
+    Without field_defs the raw line is shown in a single Line-A / Line-B pair.
+
+    Progress is reported to stderr every 500 rows via \\r in-place update.
+    Requires openpyxl (pip install openpyxl).
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        print(
+            "ERROR: openpyxl is required to write XLSX files.\n"
+            "       Install with: pip install openpyxl",
+            file=sys.stderr,
+        )
+        return
+
+    # ── Colour palette ────────────────────────────────────────────────────────
+    _fill = lambda hex6: PatternFill("solid", fgColor=hex6)
+    FILL_HDR        = _fill("1565C0")   # dark blue header
+    FILL_CHANGED    = _fill("FFF9C4")   # light yellow  — changed row
+    FILL_FIELD_CHG  = _fill("FFE082")   # amber         — changed field cell
+    FILL_ADDED      = _fill("C8E6C9")   # light green   — added row
+    FILL_REMOVED    = _fill("FFCDD2")   # light pink    — removed row
+    FONT_HDR        = Font(bold=True, color="FFFFFF", size=10)
+    FONT_MONO       = Font(name="Courier New", size=9)
+    ALIGN_CTR       = Alignment(horizontal="center", vertical="center")
+    ALIGN_TOP       = Alignment(vertical="top")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "CSV Diff"
+    ws.freeze_panes = "A2"   # keep header visible while scrolling
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    # Each record occupies 2 rows: A values on the first row, B values on the second.
+    # Key / Status / Sim% appear on the A row; Src column shows "A" / "B" on each row.
+    if field_defs:
+        hdr = ["Key", "Status", "Sim%", "Src"] + [fd.name for fd in field_defs]
+    else:
+        hdr = ["Key", "Status", "Sim%", "Src", "+Added", "-Removed", "Line"]
+
+    ws.append(hdr)
+    ws.row_dimensions[1].height = 20
+    for ci, _ in enumerate(hdr, start=1):
+        cell = ws.cell(row=1, column=ci)
+        cell.fill = FILL_HDR
+        cell.font = FONT_HDR
+        cell.alignment = ALIGN_CTR
+
+    # ── Data rows (2 rows per record) ─────────────────────────────────────────
+    total  = len(file_csv_comparisons)
+    path_s = str(xlsx_path)
+    row_ptr = 2   # current Excel row (1-based, after header)
+
+    for i, rc in enumerate(file_csv_comparisons):
+        key    = rc["key"]
+        status = rc["status"]
+        rA = row_ptr        # folder-A row
+        rB = row_ptr + 1    # folder-B row
+
+        if status == "matched":
+            d         = rc["diff"]
+            sim       = round(d["similarity_ratio"] * 100, 1)
+            identical = d["similarity_ratio"] == 1.0
+            line_a    = rc["row_a"].line
+            line_b    = rc["row_b"].line
+            lbl       = "IDENTICAL" if identical else "CHANGED"
+            row_fill  = None if identical else FILL_CHANGED
+            if field_defs:
+                vals_a = [fd.extract(line_a) for fd in field_defs]
+                vals_b = [fd.extract(line_b) for fd in field_defs]
+            else:
+                vals_a = [d["lines_added"], d["lines_deleted"], line_a]
+                vals_b = ["", "", line_b]
+
+        elif status == "added":
+            line_b = rc["row_b"].line
+            lbl, sim, row_fill = "ADDED", "", FILL_ADDED
+            identical = False
+            if field_defs:
+                vals_a = [""] * len(field_defs)
+                vals_b = [fd.extract(line_b) for fd in field_defs]
+            else:
+                vals_a = [1, 0, ""]
+                vals_b = ["", "", line_b]
+
+        else:   # removed
+            line_a = rc["row_a"].line
+            lbl, sim, row_fill = "REMOVED", "", FILL_REMOVED
+            identical = False
+            if field_defs:
+                vals_a = [fd.extract(line_a) for fd in field_defs]
+                vals_b = [""] * len(field_defs)
+            else:
+                vals_a = [0, 1, line_a]
+                vals_b = ["", "", ""]
+
+        # Write folder-A row
+        ws.cell(rA, 1, key)
+        ws.cell(rA, 2, lbl)
+        ws.cell(rA, 3, sim)
+        ws.cell(rA, 4, "A")
+        for j, v in enumerate(vals_a, start=5):
+            ws.cell(rA, j, v)
+
+        # Write folder-B row
+        ws.cell(rB, 4, "B")
+        for j, v in enumerate(vals_b, start=5):
+            ws.cell(rB, j, v)
+
+        # Row fill on both rows
+        if row_fill:
+            for col in range(1, len(hdr) + 1):
+                ws.cell(rA, col).fill = row_fill
+                ws.cell(rB, col).fill = row_fill
+
+        # Field-level amber: same column, both rows, where field value changed
+        if field_defs and status == "matched" and not identical:
+            for j, (va, vb) in enumerate(zip(vals_a, vals_b)):
+                cmp_a = normalize(va) if normalize else va
+                cmp_b = normalize(vb) if normalize else vb
+                if cmp_a != cmp_b:
+                    col = 5 + j
+                    ws.cell(rA, col).fill = FILL_FIELD_CHG
+                    ws.cell(rB, col).fill = FILL_FIELD_CHG
+
+        # Monospace font on both rows
+        for col in range(1, len(hdr) + 1):
+            ws.cell(rA, col).font = FONT_MONO
+            ws.cell(rB, col).font = FONT_MONO
+
+        row_ptr += 2
+
+        # Progress: \r in-place update every 500 rows and on the last row
+        if (i + 1) % 500 == 0 or i == total - 1:
+            print(f"\r  CSV XLSX → {path_s}  [{i+1:,} / {total:,}]",
+                  end="", flush=True, file=sys.stderr)
+
+    print(file=sys.stderr)   # newline after final progress line
+
+    # ── Column widths ─────────────────────────────────────────────────────────
+    max_key = max((len(rc["key"]) for rc in file_csv_comparisons), default=8)
+    ws.column_dimensions["A"].width = max(12, min(40, max_key + 2))
+    ws.column_dimensions["B"].width = 12   # Status
+    ws.column_dimensions["C"].width = 7    # Sim%
+    ws.column_dimensions["D"].width = 5    # Src (A / B)
+    if field_defs:
+        for j, fd in enumerate(field_defs):
+            col = get_column_letter(5 + j)
+            ws.column_dimensions[col].width = max(len(fd.name) + 4, min(fd.length + 2, 40))
+    else:
+        ws.column_dimensions["E"].width = 8    # +Added
+        ws.column_dimensions["F"].width = 10   # -Removed
+        ws.column_dimensions["G"].width = 60   # Line
+
+    wb.save(xlsx_path)
+
+
 # ---------------------------------------------------------------------------
 # SUMMARY SECTION EXTRACTION  (lines between separator_re delimiters,
 # after removing transaction-owned lines)
@@ -2087,6 +2375,8 @@ class FilePairOutcome:
     file_csv_comparisons: List[Dict] = field(default_factory=list)
     csv_header_a: Optional[List[str]] = None
     csv_header_b: Optional[List[str]] = None
+    # format-mapper field definitions (from format_mapper XLSX in split config)
+    field_defs: Optional[List[FieldDef]] = None
 
 
 def compare_folder_pair(path_a: Path,
@@ -2146,6 +2436,7 @@ def compare_folder_pair(path_a: Path,
         csv_hdr_a: Optional[List[str]] = None
         csv_hdr_b: Optional[List[str]] = None
         csv_key_cols = find_csv_key_cols(str(path_a), split_rules)
+        fld_defs = find_field_defs(str(path_a), split_rules)
         if csv_key_cols is not None:
             has_hdr = find_csv_has_header(str(path_a), split_rules)
             csv_hdr_a, csv_rows_a = parse_csv_rows(body_a, nums_a, csv_key_cols, has_hdr)
@@ -2162,7 +2453,8 @@ def compare_folder_pair(path_a: Path,
                                file_section_comparisons=file_sec,
                                file_csv_comparisons=file_csv,
                                csv_header_a=csv_hdr_a,
-                               csv_header_b=csv_hdr_b)
+                               csv_header_b=csv_hdr_b,
+                               field_defs=fld_defs)
     except Exception as exc:
         return FilePairOutcome(path_a, path_b, match_type, fuzzy_ratio,
                                result=None, error=str(exc))
@@ -2557,6 +2849,7 @@ def main():
             sec_comps = compare_summary_sections(secs_a, secs_b, normalize=normalize) if (secs_a or secs_b) else []
 
         csv_comps: Optional[List[Dict]] = None
+        csv_field_defs = find_field_defs(str(path_a), split_rules)
         csv_key_cols = find_csv_key_cols(str(path_a), split_rules)
         if csv_key_cols is not None:
             has_hdr = find_csv_has_header(str(path_a), split_rules)
@@ -2583,9 +2876,9 @@ def main():
                 write_section_csv(sec_comps, csv_path)
                 print(f"SEC CSV  → {csv_path}", file=sys.stderr)
             if csv_comps:
-                csv_path = out_p.parent / f"{out_p.stem}_csv.csv"
-                write_csv_row_csv(csv_comps, csv_path)
-                print(f"CSV ROWS → {csv_path}", file=sys.stderr)
+                xlsx_path = out_p.parent / f"{out_p.stem}_csv.xlsx"
+                write_csv_xlsx(csv_comps, xlsx_path,
+                               field_defs=csv_field_defs, normalize=normalize)
             if args.extract_txn and split_rules:
                 for p, prefix in ((path_a, "A"), (path_b, "B")):
                     extracted = extract_txn_csv_for_file(
