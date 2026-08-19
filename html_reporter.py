@@ -40,10 +40,10 @@ from report_comparator import (
     scan_folder, match_filenames, compare_folder_pair,
     FolderMatchResult, FilePairOutcome,
     diff_opcodes,
-    load_split_config, SplitRule,
+    load_split_config, SplitRule, FieldDef,
     write_txn_csv, extract_txn_csv_for_file,
     write_section_csv,
-    write_csv_row_csv,
+    write_csv_xlsx,
 )
 from date_utils import remove_dates_from_line, has_dates
 
@@ -260,15 +260,18 @@ def _b64gz(obj) -> str:
 
 
 def _diff_rows_1v1(line_a: str, line_b: str, lna: int, lnb: int,
-                   normalize=None) -> list:
+                   normalize=None, field_defs=None) -> list:
     """Fast path for single-line-to-single-line diff used by CSV row comparison.
 
-    Bypasses diff_opcodes (pandas + LIS) entirely — for one line vs one line
-    the opcode is always equal or replace, so we detect it with a direct
-    string compare and call word_diff_inline only when the lines actually differ.
-
-    Eliminates 20,000× pandas DataFrame overhead when diffing large CSV files.
+    When field_defs is provided (format-mapper XLSX was specified), each line is
+    parsed into named fields ("FIELD_NAME: value") and diffed as separate rows —
+    making it clear which named fields changed while unchanged fields appear as
+    context.  Without field_defs the raw-line word-diff path is used.
     """
+    if field_defs:
+        lines_a = [f"{fd.name}: {fd.extract(line_a)}" for fd in field_defs]
+        lines_b = [f"{fd.name}: {fd.extract(line_b)}" for fd in field_defs]
+        return _diff_rows(lines_a, lines_b, context=3, normalize=normalize)
     cmp_a = normalize(line_a) if normalize else line_a
     cmp_b = normalize(line_b) if normalize else line_b
     if cmp_a == cmp_b:
@@ -462,7 +465,9 @@ def pair_card(outcome: FilePairOutcome,
               file_section_comparisons: Optional[List[dict]] = None,
               file_csv_comparisons: Optional[List[dict]] = None,
               normalize=None,
-              card_idx: int = 0) -> Tuple[str, Optional[dict]]:
+              card_idx: int = 0,
+              field_defs=None,
+              xlsx_filename: Optional[str] = None) -> Tuple[str, Optional[dict]]:
     """Return (shell_html, card_data_dict).
     shell_html has empty panel divs; card_data_dict holds all panel data
     for the consolidated blob. card_data_dict is None for error cards.
@@ -645,34 +650,47 @@ def pair_card(outcome: FilePairOutcome,
     csv_panel  = ''
     csv_data: Optional[dict] = None
     if file_csv_comparisons:
-        csv_id = f"csv-{card_id}"
-        csv_entries = []
-        for rc in file_csv_comparisons:
-            key = rc["key"]
-            if rc["status"] == "matched":
-                cr = rc["diff"]["similarity_ratio"]
-                ca = rc["diff"]["lines_added"]
-                cd = rc["diff"]["lines_deleted"]
-                # Store raw diff rows (not per-row gzip) — card-level compression handles it.
-                # Eliminates 10K-20K individual gzip.compress calls for large CSV files.
-                diff_rows_entry = None
-                if cr < 1.0:
-                    diff_rows_entry = _diff_rows_1v1(
-                        rc["row_a"].line, rc["row_b"].line,
-                        rc["row_a"].line_number, rc["row_b"].line_number,
-                        normalize=normalize)
-                csv_entries.append([0, key, cr, ca, cd, diff_rows_entry])
-            elif rc["status"] == "added":
-                csv_entries.append([1, key])
-            else:
-                csv_entries.append([2, key])
-
         n_m = sum(1 for r2 in file_csv_comparisons if r2["status"] == "matched")
         n_a = sum(1 for r2 in file_csv_comparisons if r2["status"] == "added")
         n_r = sum(1 for r2 in file_csv_comparisons if r2["status"] == "removed")
-        csv_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r}, "rows": csv_entries}
-        csv_panel  = f'<div class="sec-detail" id="{csv_id}" data-csv-src="{csv_id}-data"></div>'
-        csv_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{csv_id}\')">▶ csv</span>'
+        if xlsx_filename:
+            # Diff detail lives in the XLSX — skip embedding the blob in the HTML card.
+            # Show a lightweight link instead so the card still communicates what was exported.
+            changed = sum(1 for r2 in file_csv_comparisons
+                          if r2["status"] == "matched" and r2["diff"]["similarity_ratio"] < 1.0)
+            parts = []
+            if n_m:  parts.append(f"{n_m:,} matched ({changed:,} changed)")
+            if n_a:  parts.append(f"{n_a:,} added")
+            if n_r:  parts.append(f"{n_r:,} removed")
+            summary = " · ".join(parts)
+            csv_toggle = (
+                f'<span class="card-toggle no-diff" title="{summary}">'
+                f'<a href="{xlsx_filename}" style="color:inherit;text-decoration:none">'
+                f'⬇ {xlsx_filename}</a></span>'
+            )
+        else:
+            csv_id = f"csv-{card_id}"
+            csv_entries = []
+            for rc in file_csv_comparisons:
+                key = rc["key"]
+                if rc["status"] == "matched":
+                    cr = rc["diff"]["similarity_ratio"]
+                    ca = rc["diff"]["lines_added"]
+                    cd = rc["diff"]["lines_deleted"]
+                    diff_rows_entry = None
+                    if cr < 1.0:
+                        diff_rows_entry = _diff_rows_1v1(
+                            rc["row_a"].line, rc["row_b"].line,
+                            rc["row_a"].line_number, rc["row_b"].line_number,
+                            normalize=normalize, field_defs=field_defs)
+                    csv_entries.append([0, key, cr, ca, cd, diff_rows_entry])
+                elif rc["status"] == "added":
+                    csv_entries.append([1, key])
+                else:
+                    csv_entries.append([2, key])
+            csv_data = {"summary": {"matched": n_m, "added": n_a, "removed": n_r}, "rows": csv_entries}
+            csv_panel  = f'<div class="sec-detail" id="{csv_id}" data-csv-src="{csv_id}-data"></div>'
+            csv_toggle = f'<span class="card-toggle" onclick="toggle(this,\'{csv_id}\')">▶ csv</span>'
 
     # ── Card shell HTML (no embedded data scripts) ───────────────────────────
     html = f"""
@@ -1641,20 +1659,25 @@ def run(folder_a: Path, folder_b: Path,
             write_section_csv(outcome.file_section_comparisons, csv_path)
             print(f"  SEC CSV → {csv_path}", file=sys.stderr)
 
-        if outcome.file_csv_comparisons:
-            csv_path = output.parent / f"{stem}_csv.csv"
-            write_csv_row_csv(outcome.file_csv_comparisons, csv_path)
-            print(f"  CSV ROWS → {csv_path}", file=sys.stderr)
-
         card_id = f"card-{i}"
         normalize = remove_dates_from_line if ignore_dates else None
+
+        xlsx_fname: Optional[str] = None
+        if outcome.file_csv_comparisons:
+            xlsx_path = output.parent / f"{stem}_csv.xlsx"
+            write_csv_xlsx(outcome.file_csv_comparisons, xlsx_path,
+                           field_defs=outcome.field_defs, normalize=normalize)
+            xlsx_fname = xlsx_path.name   # relative name for the HTML link
+
         shell, card_data = pair_card(outcome, url_a, url_b, card_id,
                                      body_a, body_b, per_page_lines,
                                      file_txn_comparisons=outcome.file_txn_comparisons or None,
                                      file_section_comparisons=outcome.file_section_comparisons or None,
                                      file_csv_comparisons=outcome.file_csv_comparisons or None,
                                      normalize=normalize,
-                                     card_idx=i)
+                                     card_idx=i,
+                                     field_defs=outcome.field_defs,
+                                     xlsx_filename=xlsx_fname)
         card_shells.append(shell)
         # Encode card data as a single gzip+base64 blob; None for error cards → empty dict
         all_card_blobs.append(_b64gz(card_data if card_data is not None else {}))
